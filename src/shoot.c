@@ -83,7 +83,7 @@ int display_idle()
     extern thunk ShootOlcApp_handler;
     if (lv) return liveview_display_idle();
     else return
-        #if !defined(CONFIG_EOSM) || !defined(CONFIG_EOSM2)
+        #if !(defined(CONFIG_EOSM) || defined(CONFIG_EOSM2))
         gui_state == GUISTATE_IDLE &&
         #endif
         !gui_menu_shown() &&
