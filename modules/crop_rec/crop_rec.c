@@ -282,7 +282,7 @@ static inline void FAST calc_skip_offsets(int * p_skip_left, int * p_skip_right,
     {
     skip_left       = 72;
     skip_right      = 0;
-    skip_top        = 30;
+    skip_top        = 28;
     skip_bottom     = 0;
     }
 
