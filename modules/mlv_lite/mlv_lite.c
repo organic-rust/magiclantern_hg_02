@@ -135,7 +135,7 @@ static CONFIG_INT("raw.card_spanning", card_spanning, 0);
 
 static CONFIG_INT("raw.res_x", resolution_index_x, 4);
 static CONFIG_INT("raw.res_x_fine", res_x_fine, 0);
-static CONFIG_INT("raw.aspect.ratio", aspect_ratio_index, 10);
+static CONFIG_INT("raw.aspect.ratio", aspect_ratio_index, 12);
 
 static CONFIG_INT("raw.write.speed", measured_write_speed, 0);
 static int measured_write_speed_thread[MAX_WRITER_THREADS] = {0};
@@ -165,7 +165,7 @@ static CONFIG_INT("raw.preview_toggle", preview_toggle, 1);
 
 static CONFIG_INT("raw.warm.up", warm_up, 0);
 static CONFIG_INT("raw.use.srm.memory", use_srm_memory, 1);
-static CONFIG_INT("raw.small.hacks", small_hacks, 1);
+static CONFIG_INT("raw.small.hacks", small_hacks, 0);
 static CONFIG_INT("raw.killgd", kill_gd, 0);
 
 static CONFIG_INT("raw.h264.proxy", h264_proxy_menu, 0);
@@ -4264,7 +4264,7 @@ static struct menu_entry raw_video_menu[] =
                             "Slow down Canon GUI, disable auto exposure, white balance...\n"
                             "+ Suspend white balance and exposure task. Locks WB/Exposure!\n"
                             "+ Disable some of LiveView streams.\n",
-                .advanced = 1,
+                .advanced = 0,
             },
             {
                 .name = "Show graph",
