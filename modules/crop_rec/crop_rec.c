@@ -1873,7 +1873,7 @@ static int patch_active = 0;
 static void update_patch()
 {
 
-    if (CROP_PRESET_MENU)
+    if (CROP_PRESET_MENU && is_movie_mode())
     {
         /* update preset */
         crop_preset = CROP_PRESET_MENU;
