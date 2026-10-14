@@ -152,7 +152,8 @@ static uint32_t MEM_MPU_RECV    = 0;
  * --------------------------------------------------------------------------- */
 
 /* 0 = leave it to Canon, 1 = FlexiZone-Single, 2 = Face+Tracking, 3 = FlexiZone-Multi */
-static CONFIG_INT("crop.mcm_af", mcm_af, 0);
+/* deliberately NOT saved: an experimental AF mode must not survive a reboot (freeze = battery pull) */
+static int mcm_af = 0;
 static int mcm_af_log = 0;                  /* not saved: print AF / MPU trace to console */
 
 static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
@@ -3023,7 +3024,6 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(set_25fps)
     MODULE_CONFIG(HDR_iso_a)
     MODULE_CONFIG(HDR_iso_b)
-    MODULE_CONFIG(mcm_af)
 MODULE_CONFIGS_END()
 
 MODULE_CBRS_START()
