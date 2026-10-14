@@ -172,6 +172,39 @@ static int aflog_r = 0;
 
 static int is_mcm_preset(int preset);
 
+/* Property-write spy: who changes PROP_LIVE_VIEW_AF_SYSTEM?
+ * Hooks Canon's prop_request_change and prop_deliver (EOS M2 1.0.3) and records
+ * writes to AF_SYSTEM / VIDEO_MODE / DISPSIZE with the caller address. */
+#define PROP_REQUEST_CHANGE_ADDR  0xFF12CDE8
+#define PROP_REQUEST_CHANGE_INSN  0xE92D43F8    /* push {r3-r9, lr} */
+#define PROP_DELIVER_ADDR         0xFF12D364
+#define PROP_DELIVER_INSN         0xE92D4FF8    /* push {r3-r11, lr} */
+
+#define PWLOG_N 16
+static struct { uint32_t caller; uint32_t val; uint8_t kind, which; } pwlog[PWLOG_N];
+static volatile int pwlog_w = 0;
+static int pwlog_r = 0;
+static int prop_spy_active = 0;
+static int prop_spy_err = 0;
+
+static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t id = regs[0];
+    int which =
+        (id == PROP_LIVE_VIEW_AF_SYSTEM) ? 'A' :
+        (id == PROP_VIDEO_MODE)          ? 'V' :
+        (id == PROP_LV_DISPSIZE)         ? 'Z' : 0;
+    if (!which) return;
+
+    uint32_t * buf = (uint32_t *) regs[1];
+    int w = pwlog_w;
+    pwlog[w % PWLOG_N].caller = PATCH_HOOK_CALLER();
+    pwlog[w % PWLOG_N].val    = buf ? buf[0] : 0xFFFFFFFF;
+    pwlog[w % PWLOG_N].kind   = (pc == PROP_DELIVER_ADDR) ? 'D' : 'R';
+    pwlog[w % PWLOG_N].which  = which;
+    pwlog_w = w + 1;
+}
+
 /* runs in the MPU receive path: keep it short, no printf / msleep here */
 static void FAST mpu_recv_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
@@ -234,6 +267,13 @@ static void mcm_af_update()
 
     /* always hooked on EOS M2, so the counters see Movie crop being switched on */
     int need_hook = 1;
+
+    if (!prop_spy_active && !prop_spy_err)
+    {
+        prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
+        prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
+        prop_spy_active = !prop_spy_err;
+    }
     if (need_hook && !mpu_hook_active)
     {
         mpu_hook_err = patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter");
@@ -262,6 +302,15 @@ static void mcm_af_poll()
             int v = mcm_af_target;
             prop_request_change(PROP_LIVE_VIEW_AF_SYSTEM, &v, 4);
         }
+    }
+
+    while (mcm_af_log && pwlog_r != pwlog_w)
+    {
+        int i = pwlog_r % PWLOG_N;
+        printf("[%c] %s val=%x from %08x\n", pwlog[i].kind,
+            pwlog[i].which == 'A' ? "AF_SYSTEM " : pwlog[i].which == 'V' ? "VIDEO_MODE" : "DISPSIZE  ",
+            pwlog[i].val, pwlog[i].caller);
+        pwlog_r++;
     }
 
     while (aflog_r != aflog_w)
@@ -2092,6 +2141,19 @@ static MENU_UPDATE_FUNC(mcm_af_menu_update)
         mpu_hook_err ? " ERR" : "",
         mcm_af_filter, mcm_af_target, mpu_spells_seen, mpu_af_spells,
         mcm_af_rewrites, mcm_af_delivers);
+
+    /* last 3 AF_SYSTEM writes, newest first: kind(R=request,D=deliver) value @caller */
+    char tmp[3][24] = {{0}};
+    int n = 0;
+    for (int k = pwlog_w - 1; k >= 0 && k >= pwlog_w - PWLOG_N && n < 3; k--)
+    {
+        int i = k % PWLOG_N;
+        if (pwlog[i].which != 'A') continue;
+        snprintf(tmp[n], sizeof(tmp[n]), "%c%d@%08x", pwlog[i].kind, (int)pwlog[i].val, pwlog[i].caller);
+        n++;
+    }
+    MENU_SET_HELP("spy:%s AF writes: %s %s %s", prop_spy_active ? "on" : prop_spy_err ? "ERR" : "off",
+        n ? tmp[0] : "none", tmp[1], tmp[2]);
 }
 
 static MENU_UPDATE_FUNC(crop_update)
