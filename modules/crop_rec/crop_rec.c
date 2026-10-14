@@ -12,6 +12,7 @@
 #include <fps.h>
 #include <shoot.h>
 #include <lens.h>
+#include <timer.h>
 
 extern WEAK_FUNC(ret_0) unsigned int is_crop_hack_supported();
 extern WEAK_FUNC(ret_0) unsigned int movie_crop_hack_enable();
@@ -134,6 +135,138 @@ static uint32_t ADTG_WRITE      = 0;
 static uint32_t MEM_ADTG_WRITE  = 0;
 static uint32_t ENGIO_WRITE     = 0;
 static uint32_t MEM_ENGIO_WRITE = 0;
+static uint32_t MPU_RECV        = 0;
+static uint32_t MEM_MPU_RECV    = 0;
+
+/* ---------------------------------------------------------------------------
+ * AF method keeper for the movie-crop presets (mcm / anamorphic, EOS M2)
+ *
+ * PROP_LIVE_VIEW_AF_SYSTEM is owned by the MPU. Canon's DIGIC firmware never
+ * writes it on its own (only the menu / Q-screen / PTP code does); the MPU
+ * re-sends it (spell 06 05 01 49 vv 00) after every PROP_VIDEO_MODE spell,
+ * and with Movie crop enabled it reports FlexiZone-Single. Re-asserting the
+ * AF method goes back to the MPU, which then drops Movie crop.
+ *
+ * Workaround: rewrite the AF byte in incoming MPU spells, so the DIGIC side
+ * keeps the method we want and the MPU is never asked to change anything.
+ * --------------------------------------------------------------------------- */
+
+/* 0 = leave it to Canon, 1 = FlexiZone-Single, 2 = Face+Tracking, 3 = FlexiZone-Multi */
+static CONFIG_INT("crop.mcm_af", mcm_af, 0);
+static int mcm_af_log = 0;                  /* not saved: print AF / MPU trace to console */
+
+static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
+static volatile int mcm_af_target   = -1;   /* PROP_LIVE_VIEW_AF_SYSTEM value we want */
+static volatile int mcm_af_restore  = 0;    /* ask MPU for mcm_af_target once crop mode is off */
+static volatile int mcm_af_rewrites = 0;
+static int mpu_hook_active = 0;
+
+#define AFLOG_N 32
+static struct { uint32_t t; uint8_t cls, id, val, rewrote; } aflog[AFLOG_N];
+static volatile int aflog_w = 0;
+static int aflog_r = 0;
+
+static int is_mcm_preset(int preset);
+
+/* runs in the MPU receive path: keep it short, no printf / msleep here */
+static void FAST mpu_recv_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint8_t * spell = (uint8_t *) regs[0];
+    if (!spell || spell[0] < 5) return;
+
+    int cls = spell[2];
+    int id  = spell[3];
+
+    int is_af   = (cls == 0x01 && id == 0x49);  /* PROP_LIVE_VIEW_AF_SYSTEM */
+    int is_vmod = (cls == 0x01 && id == 0x4e);  /* PROP_VIDEO_MODE */
+    int is_disp = (cls == 0x09 && id == 0x11);  /* PROP_LV_DISPSIZE */
+    if (!is_af && !is_vmod && !is_disp) return;
+
+    int orig = spell[4];
+    int rewrote = 0;
+
+    if (is_af && mcm_af_filter && mcm_af_target > 0 && orig != mcm_af_target)
+    {
+        spell[4] = mcm_af_target;
+        rewrote = 1;
+        mcm_af_rewrites++;
+    }
+
+    if (mcm_af_log)
+    {
+        int w = aflog_w;
+        aflog[w % AFLOG_N].t       = GET_DIGIC_TIMER();
+        aflog[w % AFLOG_N].cls     = cls;
+        aflog[w % AFLOG_N].id      = id;
+        aflog[w % AFLOG_N].val     = orig;
+        aflog[w % AFLOG_N].rewrote = rewrote;
+        aflog_w = w + 1;
+    }
+}
+
+/* called from update_patch and from the polling CBR (normal task context) */
+static void mcm_af_update()
+{
+    if (!is_EOSM2 || !MPU_RECV) return;
+
+    int want = (mcm_af != 0) && is_mcm_preset(crop_preset);
+
+    if (want && !mcm_af_filter)
+    {
+        mcm_af_target = mcm_af;
+        mcm_af_filter = 1;
+    }
+    else if (!want && mcm_af_filter)
+    {
+        mcm_af_filter = 0;
+        mcm_af_restore = 1;     /* MPU still thinks Single; fix it once crop is off */
+    }
+    else if (want)
+    {
+        mcm_af_target = mcm_af; /* menu changed while active */
+    }
+
+    int need_hook = mcm_af_filter || mcm_af_log;
+    if (need_hook && !mpu_hook_active)
+    {
+        if (patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter") == 0)
+        {
+            mpu_hook_active = 1;
+        }
+    }
+    else if (!need_hook && mpu_hook_active)
+    {
+        unpatch_memory(MPU_RECV);
+        mpu_hook_active = 0;
+    }
+}
+
+static void mcm_af_poll()
+{
+    mcm_af_update();
+
+    if (mcm_af_restore && !video_mode_crop && !RECORDING)
+    {
+        mcm_af_restore = 0;
+        if (mcm_af_target > 0 && lv_af_mode != mcm_af_target)
+        {
+            int v = mcm_af_target;
+            prop_request_change(PROP_LIVE_VIEW_AF_SYSTEM, &v, 4);
+        }
+    }
+
+    while (aflog_r != aflog_w)
+    {
+        int i = aflog_r % AFLOG_N;
+        printf("[MPU] t=%05x %s val=%d%s\n",
+            aflog[i].t,
+            (aflog[i].id == 0x49) ? "AF_SYSTEM " :
+            (aflog[i].id == 0x4e) ? "VIDEO_MODE" : "DISPSIZE  ",
+            aflog[i].val,
+            aflog[i].rewrote ? " -> rewritten" : "");
+        aflog_r++;
+    }
+}
 
 /* from SENSOR_TIMING_TABLE (fps-engio.c) or FPS override submenu */
 static int fps_main_clock = 0;
@@ -422,6 +555,12 @@ static inline int FAST calc_yres_delta()
 
 #define YRES_DELTA calc_yres_delta()
 
+
+static int is_mcm_preset(int preset)
+{
+    return preset == CROP_PRESET_mcm_mv1080_EOSM2 ||
+           preset == CROP_PRESET_anamorphic_rewired_EOSM2;
+}
 
 static int cmos_vidmode_ok = 0;
 
@@ -1905,6 +2044,8 @@ static void update_patch()
             crop_preset = 0;
         }
     }
+
+    mcm_af_update();
 }
 
 /* enable patch when switching LiveView (not in the middle of LiveView) */
@@ -1917,7 +2058,20 @@ PROP_HANDLER(PROP_LV_ACTION)
 /* also try when switching zoom modes */
 PROP_HANDLER(PROP_LV_DISPSIZE)
 {
+    if (mcm_af_log) printf("[PROP] t=%05x DISPSIZE   %d\n", GET_DIGIC_TIMER(), buf[0]);
     update_patch();
+}
+
+PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
+{
+    if (mcm_af_log) printf("[PROP] t=%05x AF_SYSTEM  %d (crop=%d, filter=%d, rewrites=%d)\n",
+        GET_DIGIC_TIMER(), buf[0], video_mode_crop, mcm_af_filter, mcm_af_rewrites);
+}
+
+PROP_HANDLER(PROP_VIDEO_MODE)
+{
+    if (mcm_af_log) printf("[PROP] t=%05x VIDEO_MODE %x %x %x %x %x\n",
+        GET_DIGIC_TIMER(), buf[0], buf[1], buf[2], buf[3], buf[4]);
 }
 
 static MENU_UPDATE_FUNC(crop_update)
@@ -1960,6 +2114,21 @@ static struct menu_entry crop_rec_menu[] =
         .update     = crop_update,
         .depends_on = DEP_LIVEVIEW,
         .children =  (struct menu_entry[]) {
+            {
+                .name   = "AF method (mcm)",
+                .priv   = &mcm_af,
+                .max    = 3,
+                .choices = CHOICES("Canon", "FlexiZone-Single", "Face+Tracking", "FlexiZone-Multi"),
+                .help   = "EOS M2 movie-crop presets: keep this AF method instead of\n"
+                          "the FlexiZone-Single that Canon's MPU forces in Movie crop.\n",
+            },
+            {
+                .name   = "AF/MPU trace",
+                .priv   = &mcm_af_log,
+                .max    = 1,
+                .help   = "Print AF_SYSTEM / VIDEO_MODE / DISPSIZE spells from the MPU\n"
+                          "and the matching property changes to the console.\n",
+            },
             {
                 .name   = "bitdepth",
                 .priv   = &bitdepth,
@@ -2512,6 +2681,8 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     /* also check at startup */
     static int lv_dirty = 1;
 
+    mcm_af_poll();
+
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
     {
@@ -2729,6 +2900,9 @@ static unsigned int crop_rec_init()
 		ENGIO_WRITE = 0xFF2C6F44;
         MEM_ENGIO_WRITE = 0xe51fc15c;
 
+        MPU_RECV = 0x3964;              /* _mpu_recv, 0xFFD21148 - RAM_OFFSET */
+        MEM_MPU_RECV = 0xE92D407C;      /* push {r2-r6, lr} */
+
         is_EOSM2 = 1;
         crop_presets                = crop_presets_eosm2;
         crop_rec_menu[0].choices    = crop_choices_eosm2;
@@ -2813,6 +2987,7 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(set_25fps)
     MODULE_CONFIG(HDR_iso_a)
     MODULE_CONFIG(HDR_iso_b)
+    MODULE_CONFIG(mcm_af)
 MODULE_CONFIGS_END()
 
 MODULE_CBRS_START()
@@ -2823,4 +2998,6 @@ MODULE_CBRS_END()
 MODULE_PROPHANDLERS_START()
     MODULE_PROPHANDLER(PROP_LV_ACTION)
     MODULE_PROPHANDLER(PROP_LV_DISPSIZE)
+    MODULE_PROPHANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
+    MODULE_PROPHANDLER(PROP_VIDEO_MODE)
 MODULE_PROPHANDLERS_END()
