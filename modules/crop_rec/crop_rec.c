@@ -253,22 +253,6 @@ static void mcm_af_poll()
 {
     mcm_af_update();
 
-    /* If Movie crop is already on, crop_rec never re-sends PROP_VIDEO_MODE, so the
-     * MPU never re-sends AF_SYSTEM and there is nothing to rewrite. Deliver the
-     * target value locally (no MPU round-trip, so Movie crop is not dropped).
-     * Rate-limited, and gives up after a few tries if something keeps undoing it. */
-    static int last_try = 0;
-    static int tries = 0;
-    if (!mcm_af_filter) tries = 0;
-    if (mcm_af_filter && lv && !RECORDING && video_mode_crop &&
-        mcm_af_target > 0 && lv_af_mode != mcm_af_target &&
-        tries < 5 && should_run_polling_action(1000, &last_try))
-    {
-        tries++;
-        mcm_af_delivers++;
-        int v = mcm_af_target;
-        prop_deliver((uint32_t *) PROP_LIVE_VIEW_AF_SYSTEM, &v, 4, 0);
-    }
 
     if (mcm_af_restore && !video_mode_crop && !RECORDING)
     {
