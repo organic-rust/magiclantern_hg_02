@@ -152,8 +152,7 @@ static uint32_t MEM_MPU_RECV    = 0;
  * --------------------------------------------------------------------------- */
 
 /* 0 = leave it to Canon, 1 = FlexiZone-Single, 2 = Face+Tracking, 3 = FlexiZone-Multi */
-/* deliberately NOT saved: an experimental AF mode must not survive a reboot (freeze = battery pull) */
-static int mcm_af = 0;
+static CONFIG_INT("crop.mcm_af", mcm_af, 0);
 static int mcm_af_log = 0;                  /* not saved: print AF / MPU trace to console */
 
 static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
@@ -233,7 +232,8 @@ static void mcm_af_update()
         mcm_af_target = mcm_af; /* menu changed while active */
     }
 
-    int need_hook = mcm_af_filter || mcm_af_log;
+    /* always hooked on EOS M2, so the counters see Movie crop being switched on */
+    int need_hook = 1;
     if (need_hook && !mpu_hook_active)
     {
         mpu_hook_err = patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter");
@@ -3008,6 +3008,7 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(set_25fps)
     MODULE_CONFIG(HDR_iso_a)
     MODULE_CONFIG(HDR_iso_b)
+    MODULE_CONFIG(mcm_af)
 MODULE_CONFIGS_END()
 
 MODULE_CBRS_START()
