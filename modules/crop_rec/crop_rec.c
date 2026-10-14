@@ -159,7 +159,11 @@ static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
 static volatile int mcm_af_target   = -1;   /* PROP_LIVE_VIEW_AF_SYSTEM value we want */
 static volatile int mcm_af_restore  = 0;    /* ask MPU for mcm_af_target once crop mode is off */
 static volatile int mcm_af_rewrites = 0;
+static volatile int mpu_spells_seen = 0;    /* any spell through the hook (proves it is installed) */
+static volatile int mpu_af_spells   = 0;    /* AF_SYSTEM spells from the MPU */
+static int mcm_af_delivers = 0;             /* local re-deliveries of the target AF value */
 static int mpu_hook_active = 0;
+static int mpu_hook_err    = 0;
 
 #define AFLOG_N 32
 static struct { uint32_t t; uint8_t cls, id, val, rewrote; } aflog[AFLOG_N];
@@ -172,6 +176,7 @@ static int is_mcm_preset(int preset);
 static void FAST mpu_recv_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint8_t * spell = (uint8_t *) regs[0];
+    mpu_spells_seen++;
     if (!spell || spell[0] < 5) return;
 
     int cls = spell[2];
@@ -184,6 +189,7 @@ static void FAST mpu_recv_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 
     int orig = spell[4];
     int rewrote = 0;
+    if (is_af) mpu_af_spells++;
 
     if (is_af && mcm_af_filter && mcm_af_target > 0 && orig != mcm_af_target)
     {
@@ -229,7 +235,8 @@ static void mcm_af_update()
     int need_hook = mcm_af_filter || mcm_af_log;
     if (need_hook && !mpu_hook_active)
     {
-        if (patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter") == 0)
+        mpu_hook_err = patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter");
+        if (mpu_hook_err == 0)
         {
             mpu_hook_active = 1;
         }
@@ -244,6 +251,23 @@ static void mcm_af_update()
 static void mcm_af_poll()
 {
     mcm_af_update();
+
+    /* If Movie crop is already on, crop_rec never re-sends PROP_VIDEO_MODE, so the
+     * MPU never re-sends AF_SYSTEM and there is nothing to rewrite. Deliver the
+     * target value locally (no MPU round-trip, so Movie crop is not dropped).
+     * Rate-limited, and gives up after a few tries if something keeps undoing it. */
+    static int last_try = 0;
+    static int tries = 0;
+    if (!mcm_af_filter) tries = 0;
+    if (mcm_af_filter && lv && !RECORDING && video_mode_crop &&
+        mcm_af_target > 0 && lv_af_mode != mcm_af_target &&
+        tries < 5 && should_run_polling_action(1000, &last_try))
+    {
+        tries++;
+        mcm_af_delivers++;
+        int v = mcm_af_target;
+        prop_deliver((uint32_t *) PROP_LIVE_VIEW_AF_SYSTEM, &v, 4, 0);
+    }
 
     if (mcm_af_restore && !video_mode_crop && !RECORDING)
     {
@@ -2074,6 +2098,17 @@ PROP_HANDLER(PROP_VIDEO_MODE)
         GET_DIGIC_TIMER(), buf[0], buf[1], buf[2], buf[3], buf[4]);
 }
 
+static MENU_UPDATE_FUNC(mcm_af_menu_update)
+{
+    MENU_SET_RINFO("AF=%d crop=%d", lv_af_mode, video_mode_crop);
+    MENU_SET_WARNING(MENU_WARN_INFO,
+        "hook:%s%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
+        !MPU_RECV ? "n/a" : mpu_hook_active ? "on" : "off",
+        mpu_hook_err ? " ERR" : "",
+        mcm_af_filter, mcm_af_target, mpu_spells_seen, mpu_af_spells,
+        mcm_af_rewrites, mcm_af_delivers);
+}
+
 static MENU_UPDATE_FUNC(crop_update)
 {
     if ((CROP_PRESET_MENU && lv) && !is_EOSM && !is_EOSM2)
@@ -2125,6 +2160,7 @@ static struct menu_entry crop_rec_menu[] =
             {
                 .name   = "AF/MPU trace",
                 .priv   = &mcm_af_log,
+                .update = mcm_af_menu_update,
                 .max    = 1,
                 .help   = "Print AF_SYSTEM / VIDEO_MODE / DISPSIZE spells from the MPU\n"
                           "and the matching property changes to the console.\n",
