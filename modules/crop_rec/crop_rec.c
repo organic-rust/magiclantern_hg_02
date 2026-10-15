@@ -2644,6 +2644,28 @@ static MENU_UPDATE_FUNC(dmlog_menu_update)
     else              MENU_SET_RINFO("NOT hooked %x", dm_insn_seen);
 }
 
+/* Live readout of Canon's AF frame state machine (GmtWakuState), EOS M2 1.0.3.
+ * gmt 'this' is stored at 0x921F4+0x14; its StateObject at gmt+0x18 (current state at +0x1C).
+ * 0x754: face sub-mode used by gmtStartServoAFFaceTrack; 0x1AC: LvMode index;
+ * 0x744: magnify; 0x7C0: MF flag; per-mode entry (0x34 bytes) +0xC0: Digital zoom flag. */
+static MENU_UPDATE_FUNC(gmt_state_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    uint32_t gmt = *(volatile uint32_t *)(0x921F4 + 0x14);
+    if (!gmt || gmt > 0x10000000) { MENU_SET_VALUE("no gmt"); return; }
+    uint32_t so = *(volatile uint32_t *)(gmt + 0x18);
+    int st   = (so && so < 0x10000000) ? (int) *(volatile uint32_t *)(so + 0x1C) : -1;
+    int sub  = *(volatile int *)(gmt + 0x754);
+    int mode = *(volatile int *)(gmt + 0x1AC);
+    int mag  = *(volatile int *)(gmt + 0x744);
+    int mf   = *(volatile int *)(gmt + 0x7C0);
+    int dz   = (mode >= 0 && mode < 8) ? *(volatile int *)(gmt + mode * 0x34 + 0xC0) : -1;
+    MENU_SET_VALUE("st %d sub %d", st, sub);
+    MENU_SET_RINFO("AF=%d servo=%d", lv_af_mode, movie_servo_af);
+    MENU_SET_WARNING(MENU_WARN_INFO, "waku state %d, 0x754=%d, mode=%d, mag=%x, mf=%d, dzflag=%d, crop=%d",
+        st, sub, mode, mag, mf, dz, video_mode_crop);
+}
+
 static MENU_UPDATE_FUNC(crop_update)
 {
     if ((CROP_PRESET_MENU && lv) && !is_EOSM && !is_EOSM2)
@@ -3158,6 +3180,13 @@ static struct menu_entry crop_rec_menu[] =
             MENU_ADVANCED_TOGGLE,
             MENU_EOL,
         },
+    },
+    {
+        .name       = "AF state (debug)",
+        .update     = gmt_state_update,
+        .depends_on = DEP_LIVEVIEW,
+        .help       = "Live values from Canon's AF frame state machine (GmtWakuState).\n"
+                      "Temporary, for the mcm AF work.\n",
     },
 };
 
