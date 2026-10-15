@@ -157,7 +157,9 @@ static int mcm_af_log = 0;                  /* not saved: print AF / MPU trace t
 
 static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
 static volatile int mcm_af_target   = -1;   /* PROP_LIVE_VIEW_AF_SYSTEM value we want */
-static volatile int mcm_af_restore  = 0;    /* ask MPU for mcm_af_target once crop mode is off */
+static volatile int mcm_af_restore  = 0;
+static uint32_t cur_video_mode[16];         /* last PROP_VIDEO_MODE seen, to re-send it */
+static int cur_video_mode_len = 0;    /* ask MPU for mcm_af_target once crop mode is off */
 static volatile int mcm_af_rewrites = 0;
 static volatile int mpu_spells_seen = 0;    /* any spell through the hook (proves it is installed) */
 static volatile int mpu_af_spells   = 0;    /* AF_SYSTEM spells from the MPU */
@@ -536,6 +538,22 @@ static void mcm_af_update()
 static void mcm_af_poll()
 {
     mcm_af_update();
+
+    /* Startup case: Canon restores Movie crop and the MPU's AF value (1) from its settings,
+     * so movie_crop_hack_enable() has nothing to send and the MPU never replies through the
+     * filter. Re-send the current VIDEO_MODE once (like leaving the menu does), so the MPU's
+     * linked reply - including AF_SYSTEM - passes through the filter. Max 2 tries per LV session. */
+    static int resync_tries = 0;
+    static int resync_last = 0;
+    if (!lv || !mcm_af_filter) resync_tries = 0;
+    if (mcm_af_filter && pstate_hook_err == 0 && lv && video_mode_crop && !RECORDING &&
+        !gui_menu_shown() && mcm_af_target > 0 && lv_af_mode != mcm_af_target &&
+        cur_video_mode_len >= 20 && resync_tries < 2 &&
+        should_run_polling_action(2000, &resync_last))
+    {
+        resync_tries++;
+        prop_request_change(PROP_VIDEO_MODE, cur_video_mode, cur_video_mode_len);
+    }
 
 
     if (mcm_af_restore && !video_mode_crop && !RECORDING)
@@ -2395,6 +2413,8 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
 
 PROP_HANDLER(PROP_VIDEO_MODE)
 {
+    cur_video_mode_len = MIN(len, sizeof(cur_video_mode));
+    memcpy(cur_video_mode, buf, cur_video_mode_len);
     dmlog_add(DM_MARKER, 0, "*** ML-SPY VIDEO_MODE notify %x %x %x %x %x", buf[0], buf[1], buf[2], buf[3], buf[4]);
     if (mcm_af_log) printf("[PROP] t=%05x VIDEO_MODE %x %x %x %x %x\n",
         GET_DIGIC_TIMER(), buf[0], buf[1], buf[2], buf[3], buf[4]);
