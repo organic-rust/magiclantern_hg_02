@@ -499,16 +499,18 @@ static void mcm_af_update()
         mcm_af_target = mcm_af; /* menu changed while active */
     }
 
-    /* always hooked on EOS M2, so the counters see Movie crop being switched on */
-    int need_hook = 1;
+    /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
+    if (mcm_af != 0 && pstate_hook_err == -1)     /* try once; ERR is shown in the menu */
+    {
+        pstate_hook_err = patch_hook_function(PSTATE_MPU_IN_ADDR, PSTATE_MPU_IN_INSN, &pstate_mpu_in_hook, "crop_rec: PropertyState MPU AF filter");
+    }
 
-    if (!prop_spy_active && !prop_spy_err)
+    /* diagnostics (property-write spies, MPU spell trace, Canon DebugMsg capture):
+     * only installed once "AF/MPU trace" is turned on; they stay until reboot */
+    if (mcm_af_log && !prop_spy_active && !prop_spy_err)
     {
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
-        /* deliver-array / PropertyMgr post / SetPropertyData spies are no longer installed:
-         * the forced AF value was found in PropertyState's MPU input (see pstate_mpu_in_hook) */
-        pstate_hook_err = patch_hook_function(PSTATE_MPU_IN_ADDR, PSTATE_MPU_IN_INSN, &pstate_mpu_in_hook, "crop_rec: PropertyState MPU AF filter");
         dmlog_hooked = install_debugmsg_capture();
         prop_spy_active = !prop_spy_err;
 
@@ -522,19 +524,12 @@ static void mcm_af_update()
                 prop_spy_err |= 0x10000;
             }
         }
-    }
-    if (need_hook && !mpu_hook_active)
-    {
-        mpu_hook_err = patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU AF filter");
-        if (mpu_hook_err == 0)
+
+        if (!mpu_hook_active)
         {
-            mpu_hook_active = 1;
+            mpu_hook_err = patch_hook_function(MPU_RECV, MEM_MPU_RECV, &mpu_recv_hook, "crop_rec: MPU spell trace");
+            mpu_hook_active = (mpu_hook_err == 0);
         }
-    }
-    else if (!need_hook && mpu_hook_active)
-    {
-        unpatch_memory(MPU_RECV);
-        mpu_hook_active = 0;
     }
 }
 
@@ -2638,8 +2633,8 @@ static struct menu_entry crop_rec_menu[] =
                 .priv   = &mcm_af_log,
                 .update = mcm_af_menu_update,
                 .max    = 1,
-                .help   = "Print AF_SYSTEM / VIDEO_MODE / DISPSIZE spells from the MPU\n"
-                          "and the matching property changes to the console.\n",
+                .help   = "Debug only: installs the property/MPU spies and the Canon log\n"
+                          "capture (stay active until reboot). Leave OFF for normal use.\n",
             },
             {
                 .name   = "Prop write log",
