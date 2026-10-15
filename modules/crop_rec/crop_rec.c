@@ -344,6 +344,18 @@ static int pstate_hook_err = -1;
 #define NOFACE_DZOOM_BRANCH_NEW   0xEA00001E    /* b   FF18F6DC (MULTI AF) */
 static int noface_patched = 0;
 
+/* Gmt PROP_MOVIE_PARAM handler (FF17D284) stores the Digital zoom field of the property into
+ * gmt+0x128, which is the per-LvMode "Digital zoom" flag for movie mode (LvMode 2: 2*0x34+0xC0).
+ * Every DZOOM special case in GmtWakuState (centre-only available area, face sub-mode 0 instead
+ * of 6, "Tracking LCR Ignore", TRACK instead of MULTI continuous AF window...) keys off it.
+ * In the mcm preset the image is not really zoomed, so store 0 instead: Gmt then frames and
+ * tracks exactly as without Digital zoom. */
+#define GMT_DZFLAG_LOAD_ADDR      0xFF17D2B4
+#define GMT_DZFLAG_LOAD_ORIG      0xE5950010    /* ldr r0, [r5, #0x10] */
+#define GMT_DZFLAG_LOAD_NEW       0xE3A00000    /* mov r0, #0 */
+#define GMT_DZFLAG_OFFSET         0x128
+static int dzflag_patched = 0;
+
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t * m = (uint32_t *) regs[1];
@@ -552,6 +564,27 @@ static void mcm_af_update()
     {
         unpatch_memory(NOFACE_DZOOM_BRANCH_ADDR);
         noface_patched = 0;
+    }
+
+    /* Face+Tracking: make Gmt (AF frames, tracking, Servo AF window) ignore Digital zoom */
+    if (want_noface && !dzflag_patched)
+    {
+        dzflag_patched = (patch_instruction(GMT_DZFLAG_LOAD_ADDR, GMT_DZFLAG_LOAD_ORIG,
+            GMT_DZFLAG_LOAD_NEW, "crop_rec: Gmt ignores Digital zoom (mcm Face+Tracking)") == 0);
+    }
+    else if (!want_noface && dzflag_patched)
+    {
+        unpatch_memory(GMT_DZFLAG_LOAD_ADDR);
+        dzflag_patched = 0;
+    }
+    if (dzflag_patched)
+    {
+        /* the value stored before the patch (e.g. at boot) stays until the next PROP_MOVIE_PARAM */
+        uint32_t gmt = *(volatile uint32_t *)(0x921F4 + 0x14);
+        if (gmt && gmt < 0x10000000 && *(volatile uint32_t *)(gmt + GMT_DZFLAG_OFFSET))
+        {
+            *(volatile uint32_t *)(gmt + GMT_DZFLAG_OFFSET) = 0;
+        }
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2489,7 +2522,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d", lv_af_mode, video_mode_crop, noface_patched);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
