@@ -330,6 +330,15 @@ static int noface_patched = 0;
 #define TRACK_DZOOM_BRANCH_NEW    0xEA000014    /* b   FF193BA0 */
 static int track_patched = 0;
 
+/* gmtUpdateTrack (FF18DE68), "Trust Over" (tracked object lost): without Digital zoom it falls
+ * back to SetTrackBitCenter -> SetTrackingFrame type 64 (servo wide area, sub-mode 6/7, stays in
+ * state 12). With Digital zoom it jumps to FF18E1D4 instead, which sets waku state 0 (small box).
+ * NOP the Digital zoom branch so the wide area is used. */
+#define LOST_DZOOM_BRANCH_ADDR    0xFF18E050
+#define LOST_DZOOM_BRANCH_ORIG    0x1A00005F    /* bne FF18E1D4 (set state 0) */
+#define LOST_DZOOM_BRANCH_NEW     0xE1A00000    /* nop */
+static int lost_patched = 0;
+
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t * m = (uint32_t *) regs[1];
@@ -548,6 +557,16 @@ static void mcm_af_update()
     {
         unpatch_memory(TRACK_DZOOM_BRANCH_ADDR);
         track_patched = 0;
+    }
+    if (want_noface && !lost_patched)
+    {
+        lost_patched = (patch_instruction(LOST_DZOOM_BRANCH_ADDR, LOST_DZOOM_BRANCH_ORIG,
+            LOST_DZOOM_BRANCH_NEW, "crop_rec: Face+Tracking lost track -> servo wide area in Digital zoom") == 0);
+    }
+    else if (!want_noface && lost_patched)
+    {
+        unpatch_memory(LOST_DZOOM_BRANCH_ADDR);
+        lost_patched = 0;
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2485,7 +2504,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d tr=%d", lv_af_mode, video_mode_crop, noface_patched, track_patched);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d tr=%d lt=%d", lv_af_mode, video_mode_crop, noface_patched, track_patched, lost_patched);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
