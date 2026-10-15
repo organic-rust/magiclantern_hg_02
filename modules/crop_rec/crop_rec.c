@@ -158,6 +158,7 @@ static int mcm_af_log = 0;                  /* not saved: print AF / MPU trace t
 static volatile int mcm_af_filter   = 0;    /* rewrite AF spells from the MPU */
 static volatile int mcm_af_target   = -1;   /* PROP_LIVE_VIEW_AF_SYSTEM value we want */
 static volatile int mcm_af_restore  = 0;
+static volatile int movie_servo_af  = 0;    /* PROP_MOVIE_SERVO_AF */
 static uint32_t cur_video_mode[16];         /* last PROP_VIDEO_MODE seen, to re-send it */
 static int cur_video_mode_len = 0;    /* ask MPU for mcm_af_target once crop mode is off */
 static volatile int mcm_af_rewrites = 0;
@@ -2411,6 +2412,11 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
         GET_DIGIC_TIMER(), buf[0], video_mode_crop, mcm_af_filter, mcm_af_rewrites);
 }
 
+PROP_HANDLER(PROP_MOVIE_SERVO_AF)
+{
+    movie_servo_af = buf[0];
+}
+
 PROP_HANDLER(PROP_VIDEO_MODE)
 {
     cur_video_mode_len = MIN(len, sizeof(cur_video_mode));
@@ -2418,6 +2424,15 @@ PROP_HANDLER(PROP_VIDEO_MODE)
     dmlog_add(DM_MARKER, 0, "*** ML-SPY VIDEO_MODE notify %x %x %x %x %x", buf[0], buf[1], buf[2], buf[3], buf[4]);
     if (mcm_af_log) printf("[PROP] t=%05x VIDEO_MODE %x %x %x %x %x\n",
         GET_DIGIC_TIMER(), buf[0], buf[1], buf[2], buf[3], buf[4]);
+}
+
+static MENU_UPDATE_FUNC(mcm_af_choice_update)
+{
+    if (mcm_af >= 2 && movie_servo_af)
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE,
+            "Movie Servo AF on: LiveView froze ~15-20s into recording in tests. Turn it off.");
+    }
 }
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
@@ -2643,6 +2658,7 @@ static struct menu_entry crop_rec_menu[] =
             {
                 .name   = "AF method (mcm)",
                 .priv   = &mcm_af,
+                .update = mcm_af_choice_update,
                 .max    = 3,
                 .choices = CHOICES("Canon", "FlexiZone-Single", "Face+Tracking", "FlexiZone-Multi"),
                 .help   = "EOS M2 movie-crop presets: keep this AF method instead of\n"
@@ -3513,6 +3529,12 @@ static unsigned int crop_rec_init()
     menu_add("Movie", crop_rec_menu, COUNT(crop_rec_menu));
     lvinfo_add_items (info_items, COUNT(info_items));
 
+    /* When booting straight into LiveView, PROP_LV_ACTION / PROP_LV_DISPSIZE usually fire
+     * before our prop handlers are registered, so the hooks were only installed after
+     * something re-triggered them (e.g. pressing MENU twice). Do it once here; the
+     * polling CBR refreshes LiveView at startup so the mode is applied cleanly. */
+    update_patch();
+
     return 0;
 }
 
@@ -3548,4 +3570,5 @@ MODULE_PROPHANDLERS_START()
     MODULE_PROPHANDLER(PROP_LV_DISPSIZE)
     MODULE_PROPHANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
     MODULE_PROPHANDLER(PROP_VIDEO_MODE)
+    MODULE_PROPHANDLER(PROP_MOVIE_SERVO_AF)
 MODULE_PROPHANDLERS_END()
