@@ -312,6 +312,15 @@ static int install_debugmsg_capture()
 #define PSTATE_MPU_IN_INSN  0xE92D41F0      /* push {r4-r8, lr} */
 static int pstate_hook_err = -1;
 
+/* gmtUpdateNoface (FF18F270): with Digital zoom active, Face+Tracking without a face falls
+ * back to "##### DZOOM AF #####" (one small box). Without Digital zoom it uses
+ * "##### MULTI AF #####" (wide multi-zone). Make the branch at FF18F65C unconditional
+ * so the multi-zone fallback is used in the mcm preset too. */
+#define NOFACE_DZOOM_BRANCH_ADDR  0xFF18F65C
+#define NOFACE_DZOOM_BRANCH_ORIG  0x0A00001E    /* beq FF18F6DC (MULTI AF) */
+#define NOFACE_DZOOM_BRANCH_NEW   0xEA00001E    /* b   FF18F6DC (MULTI AF) */
+static int noface_patched = 0;
+
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t * m = (uint32_t *) regs[1];
@@ -507,6 +516,19 @@ static void mcm_af_update()
     else if (want)
     {
         mcm_af_target = mcm_af; /* menu changed while active */
+    }
+
+    /* Face+Tracking: use the multi-zone no-face fallback instead of the Digital zoom single box */
+    int want_noface = mcm_af_filter && mcm_af_target == 2;
+    if (want_noface && !noface_patched)
+    {
+        noface_patched = (patch_instruction(NOFACE_DZOOM_BRANCH_ADDR, NOFACE_DZOOM_BRANCH_ORIG,
+            NOFACE_DZOOM_BRANCH_NEW, "crop_rec: Face+Tracking no-face multi AF in Digital zoom") == 0);
+    }
+    else if (!want_noface && noface_patched)
+    {
+        unpatch_memory(NOFACE_DZOOM_BRANCH_ADDR);
+        noface_patched = 0;
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2444,7 +2466,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d", lv_af_mode, video_mode_crop);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d", lv_af_mode, video_mode_crop, noface_patched);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
