@@ -2344,12 +2344,14 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
 {
     int v = buf[0];
     dmlog_add(DM_MARKER, 0, "*** ML-SPY AF_SYSTEM notify %d (crop=%d dispsize=%d)", v, video_mode_crop, lv_dispsize, 0, 0);
+    /* freeze the Canon log on the forced switch: any AF notification while Digital zoom is on
+     * (the forced 1 can arrive as the very first notification, so don't require a known old value) */
+    if ((video_mode_crop || (af_last_val >= 0 && v != af_last_val)) && !dmlog_stop_at)
+    {
+        dmlog_stop_at = dmlog_w + 256;      /* keep the lead-up, plus a bit after */
+    }
     if (v != af_last_val)
     {
-        if (af_last_val >= 0 && !dmlog_stop_at)
-        {
-            dmlog_stop_at = dmlog_w + 256;  /* keep the lead-up, plus a bit after */
-        }
         int n = af_notify_count;
         int k = (n == 0) ? 0 : 1;
         af_notify[k].old  = af_last_val;
