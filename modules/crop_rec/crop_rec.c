@@ -200,7 +200,7 @@ static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     int w = pwlog_w;
     pwlog[w % PWLOG_N].caller = PATCH_HOOK_CALLER();
     pwlog[w % PWLOG_N].val    = buf ? buf[0] : 0xFFFFFFFF;
-    pwlog[w % PWLOG_N].kind   = (pc == PROP_DELIVER_ADDR) ? 'D' : 'R';
+    pwlog[w % PWLOG_N].kind   = (pc == PROP_DELIVER_ADDR) ? 'D' : (pc == PROP_REQUEST_CHANGE_ADDR) ? 'R' : 'W';
     pwlog[w % PWLOG_N].which  = which;
     pwlog_w = w + 1;
 }
@@ -273,6 +273,17 @@ static void mcm_af_update()
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
         prop_spy_active = !prop_spy_err;
+
+        /* ML core wrapper: records the real caller of set_lv_zoom & co. */
+        uint32_t wait_addr = (uint32_t) &prop_request_change_wait;
+        uint32_t wait_insn = *(volatile uint32_t *) wait_addr;
+        if ((wait_insn & 0xFFFF0000) == 0xE92D0000)    /* push {...} */
+        {
+            if (patch_hook_function(wait_addr, wait_insn, &prop_write_hook, "crop_rec: prop_request_change_wait spy"))
+            {
+                prop_spy_err |= 0x10000;
+            }
+        }
     }
     if (need_hook && !mpu_hook_active)
     {
@@ -2142,18 +2153,30 @@ static MENU_UPDATE_FUNC(mcm_af_menu_update)
         mcm_af_filter, mcm_af_target, mpu_spells_seen, mpu_af_spells,
         mcm_af_rewrites, mcm_af_delivers);
 
-    /* last 3 AF_SYSTEM writes, newest first: kind(R=request,D=deliver) value @caller */
+}
+
+static MENU_UPDATE_FUNC(prop_log_menu_update)
+{
+    /* last 3 writes to AF_SYSTEM (A) / VIDEO_MODE (V) / DISPSIZE (Z), newest first.
+     * kind: W = ML prop_request_change_wait, R = Canon prop_request_change, D = prop_deliver */
     char tmp[3][24] = {{0}};
     int n = 0;
     for (int k = pwlog_w - 1; k >= 0 && k >= pwlog_w - PWLOG_N && n < 3; k--)
     {
         int i = k % PWLOG_N;
-        if (pwlog[i].which != 'A') continue;
-        snprintf(tmp[n], sizeof(tmp[n]), "%c%d@%08x", pwlog[i].kind, (int)pwlog[i].val, pwlog[i].caller);
+        snprintf(tmp[n], sizeof(tmp[n]), "%c%c%x@%x", pwlog[i].kind, pwlog[i].which,
+            (int)(pwlog[i].val & 0xFF), pwlog[i].caller);
         n++;
     }
-    MENU_SET_HELP("spy:%s AF writes: %s %s %s", prop_spy_active ? "on" : prop_spy_err ? "ERR" : "off",
-        n ? tmp[0] : "none", tmp[1], tmp[2]);
+    int af_writes = 0;
+    for (int k = pwlog_w - 1; k >= 0 && k >= pwlog_w - PWLOG_N; k--)
+        if (pwlog[k % PWLOG_N].which == 'A') af_writes++;
+
+    MENU_SET_VALUE("%d", pwlog_w);
+    MENU_SET_RINFO("AF writes:%d", af_writes);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%s %s %s %s",
+        prop_spy_active ? "" : prop_spy_err ? "spy ERR" : "spy off",
+        n > 0 ? tmp[0] : "none", tmp[1], tmp[2]);
 }
 
 static MENU_UPDATE_FUNC(crop_update)
@@ -2211,6 +2234,12 @@ static struct menu_entry crop_rec_menu[] =
                 .max    = 1,
                 .help   = "Print AF_SYSTEM / VIDEO_MODE / DISPSIZE spells from the MPU\n"
                           "and the matching property changes to the console.\n",
+            },
+            {
+                .name   = "Prop write log",
+                .update = prop_log_menu_update,
+                .help   = "Last writes to AF_SYSTEM(A) / VIDEO_MODE(V) / DISPSIZE(Z).\n"
+                          "W=ML wait wrapper, R=Canon request, D=deliver; value@caller.\n",
             },
             {
                 .name   = "bitdepth",
