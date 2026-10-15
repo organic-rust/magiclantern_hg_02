@@ -359,11 +359,19 @@ static int dzflag_patched = 0;
 /* Same handler, later (FF17D4DC): "if (gmt+0x128) configure the contrast AF engine for Digital
  * zoom" - ff389678(fps, dz) sets the TVAF evaluation timing/ratio (6 / 300 for zoom 2). With the
  * flag stored as 0 that setup would be skipped while the sensor still runs in Digital zoom
- * readout, so read the real value from the property (r5 = PROP_MOVIE_PARAM data) instead. */
-#define GMT_TVAF_DZ_LOAD_ADDR     0xFF17D4DC
-#define GMT_TVAF_DZ_LOAD_ORIG     0xE5941128    /* ldr r1, [r4, #0x128] */
-#define GMT_TVAF_DZ_LOAD_NEW      0xE5951010    /* ldr r1, [r5, #0x10]  */
+ * readout, so pass the real value from the property (r5 = PROP_MOVIE_PARAM data) instead.
+ * FF17D4DC itself can't be patched: its cache index collides with ML's boot-time engio patch at
+ * FF2C6CD8. So patch the next two words, which share a cache line with the engage branch below:
+ *   FF17D4E0  cmp r1, #0           -> ldr r1, [r5, #0x10]
+ *   FF17D4E4  beq FF17D51C         -> nop  (mcm is always Digital zoom, so always do the setup) */
+#define GMT_TVAF_DZ_LOAD_ADDR     0xFF17D4E0
+#define GMT_TVAF_DZ_LOAD_ORIG     0xE3510000    /* cmp r1, #0 */
+#define GMT_TVAF_DZ_LOAD_NEW      0xE5951010    /* ldr r1, [r5, #0x10] */
+#define GMT_TVAF_DZ_SKIP_ADDR     0xFF17D4E4
+#define GMT_TVAF_DZ_SKIP_ORIG     0x0A00000C    /* beq FF17D51C */
+#define GMT_TVAF_DZ_SKIP_NEW      0xE1A00000    /* nop */
 static int tvafdz_patched = 0;
+static int dzflag_errcode = 0;  /* patch error bits | which step (<<8) */
 
 /* ...and right after that setup (FF17D4FC): "if the stored flag was 0 before (Digital zoom just
  * engaged): set [0xF30], post Gmt events 10 and 0" - that resets the AF frame to the Digital zoom
@@ -588,14 +596,30 @@ static void mcm_af_update()
     if (want_noface && !dzflag_patched && !dzflag_err)
     {
         /* TVAF setup patch first, so the handler never runs with only half of the change */
-        dzengage_patched = (patch_instruction(GMT_DZ_ENGAGE_BRANCH_ADDR, GMT_DZ_ENGAGE_BRANCH_ORIG,
-            GMT_DZ_ENGAGE_BRANCH_NEW, "crop_rec: skip Gmt Digital zoom engage reset (mcm Face+Tracking)") == 0);
-        tvafdz_patched = dzengage_patched && (patch_instruction(GMT_TVAF_DZ_LOAD_ADDR, GMT_TVAF_DZ_LOAD_ORIG,
-            GMT_TVAF_DZ_LOAD_NEW, "crop_rec: TVAF keeps Digital zoom setup (mcm Face+Tracking)") == 0);
+        int e;
+        e = patch_instruction(GMT_DZ_ENGAGE_BRANCH_ADDR, GMT_DZ_ENGAGE_BRANCH_ORIG,
+            GMT_DZ_ENGAGE_BRANCH_NEW, "crop_rec: skip Gmt Digital zoom engage reset (mcm Face+Tracking)");
+        dzengage_patched = (e == 0);
+        if (e) dzflag_errcode = e | 0x100;
+        if (dzengage_patched)
+        {
+            e = patch_instruction(GMT_TVAF_DZ_LOAD_ADDR, GMT_TVAF_DZ_LOAD_ORIG,
+                GMT_TVAF_DZ_LOAD_NEW, "crop_rec: TVAF Digital zoom setup, real value (mcm Face+Tracking)");
+            if (e == 0)
+            {
+                e = patch_instruction(GMT_TVAF_DZ_SKIP_ADDR, GMT_TVAF_DZ_SKIP_ORIG,
+                    GMT_TVAF_DZ_SKIP_NEW, "crop_rec: TVAF Digital zoom setup, always (mcm Face+Tracking)");
+                if (e) unpatch_memory(GMT_TVAF_DZ_LOAD_ADDR);
+            }
+            tvafdz_patched = (e == 0);
+            if (e) dzflag_errcode = e | 0x200;
+        }
         if (tvafdz_patched)
         {
-            dzflag_patched = (patch_instruction(GMT_DZFLAG_LOAD_ADDR, GMT_DZFLAG_LOAD_ORIG,
-                GMT_DZFLAG_LOAD_NEW, "crop_rec: Gmt ignores Digital zoom (mcm Face+Tracking)") == 0);
+            e = patch_instruction(GMT_DZFLAG_LOAD_ADDR, GMT_DZFLAG_LOAD_ORIG,
+                GMT_DZFLAG_LOAD_NEW, "crop_rec: Gmt ignores Digital zoom (mcm Face+Tracking)");
+            dzflag_patched = (e == 0);
+            if (e) dzflag_errcode = e | 0x300;
         }
         dzflag_err = !dzflag_patched;
     }
@@ -606,6 +630,7 @@ static void mcm_af_update()
     }
     if (!dzflag_patched && tvafdz_patched)
     {
+        unpatch_memory(GMT_TVAF_DZ_SKIP_ADDR);
         unpatch_memory(GMT_TVAF_DZ_LOAD_ADDR);
         tvafdz_patched = 0;
     }
@@ -2559,7 +2584,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d%d", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched, dzengage_patched);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d%d e%x", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched, dzengage_patched, dzflag_errcode);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
