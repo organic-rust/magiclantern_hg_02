@@ -297,6 +297,37 @@ static int install_debugmsg_capture()
     return 0;
 }
 
+/* PropertyState.c: incoming MPU property messages (FF329840).
+ * regs[1] -> { class, id, data*, len, ... }. The MPU's reply to a VIDEO_MODE change
+ * carries class 1 id 0x49 (PROP_LIVE_VIEW_AF_SYSTEM); with Digital zoom on it says 1
+ * (FlexiZone-Single). Rewriting the data here, before PropertyState stores and delivers
+ * it, keeps the chosen AF method on the DIGIC side without asking the MPU anything. */
+#define PSTATE_MPU_IN_ADDR  0xFF329840
+#define PSTATE_MPU_IN_INSN  0xE92D41F0      /* push {r4-r8, lr} */
+static int pstate_hook_err = -1;
+
+static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * m = (uint32_t *) regs[1];
+    if (!m || ((uint32_t) m & 3) || (uint32_t) m > 0x10000000) return;
+    if (m[0] != 1 || m[1] != 0x49) return;
+
+    uint8_t * data = (uint8_t *) m[2];
+    if (!data || (uint32_t) data > 0x10000000) return;
+
+    int orig = data[0];
+    int rewrote = 0;
+    mpu_af_spells++;
+    if (mcm_af_filter && mcm_af_target > 0 && orig != mcm_af_target)
+    {
+        data[0] = mcm_af_target;
+        rewrote = 1;
+        mcm_af_rewrites++;
+    }
+    dmlog_add(DM_MARKER, rewrote, "*** ML-SPY PropertyState MPU AF_SYSTEM in: %d -> %d (len %d)",
+        orig, data[0], m[3], 0, 0);
+}
+
 static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t id = regs[0];
@@ -475,9 +506,9 @@ static void mcm_af_update()
     {
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
-        prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
-        prop_spy_err |= patch_hook_function(PROPMGR_POST_ADDR, PROPMGR_POST_INSN, &propmgr_post_hook, "crop_rec: PropertyMgr post spy") << 12;
-        prop_spy_err |= patch_hook_function(SET_PROP_DATA_ADDR, SET_PROP_DATA_INSN, &set_prop_data_hook, "crop_rec: SetPropertyData spy") << 20;
+        /* deliver-array / PropertyMgr post / SetPropertyData spies are no longer installed:
+         * the forced AF value was found in PropertyState's MPU input (see pstate_mpu_in_hook) */
+        pstate_hook_err = patch_hook_function(PSTATE_MPU_IN_ADDR, PSTATE_MPU_IN_INSN, &pstate_mpu_in_hook, "crop_rec: PropertyState MPU AF filter");
         dmlog_hooked = install_debugmsg_capture();
         prop_spy_active = !prop_spy_err;
 
@@ -2378,9 +2409,8 @@ static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
     MENU_SET_RINFO("AF=%d crop=%d", lv_af_mode, video_mode_crop);
     MENU_SET_WARNING(MENU_WARN_INFO,
-        "hook:%s%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
-        !MPU_RECV ? "n/a" : mpu_hook_active ? "on" : "off",
-        mpu_hook_err ? " ERR" : "",
+        "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
+        pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
         mcm_af_filter, mcm_af_target, mpu_spells_seen, mpu_af_spells,
         mcm_af_rewrites, mcm_af_delivers);
 
