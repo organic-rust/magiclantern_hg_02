@@ -214,6 +214,38 @@ static struct { uint32_t val, api, ret[4]; } setdata_af[2];        /* [0] first,
 static int prop_spy_active = 0;
 static int prop_spy_err = 0;
 
+/* ---------------------------------------------------------------------------
+ * Canon DebugMsg capture: records (class, level, fmt, 5 args) of every Canon
+ * debug message into a ring buffer, plus our own markers, and saves it to
+ * ML/AFLOG.TXT on request. Formatting happens only at save time.
+ * --------------------------------------------------------------------------- */
+#define DEBUGMSG_ADDR   0x4398
+#define DEBUGMSG_INSN   0xE92D000F      /* push {r0-r3} */
+#define DMLOG_N         4096
+#define DM_MARKER       0xFFFF
+struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a[5]; };
+static struct dmlog_entry dmlog[DMLOG_N];
+static volatile int dmlog_w = 0;
+static volatile int dmlog_paused = 0;
+static int dmlog_hooked = 0;
+
+static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    if (dmlog_paused) return;
+    int w = dmlog_w;
+    struct dmlog_entry * e = &dmlog[w % DMLOG_N];
+    e->t = GET_DIGIC_TIMER();
+    e->cls = cls; e->lvl = lvl; e->fmt = fmt;
+    e->a[0] = a0; e->a[1] = a1; e->a[2] = a2; e->a[3] = a3; e->a[4] = a4;
+    dmlog_w = w + 1;
+}
+
+static void FAST debugmsg_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    /* DryosDebugMsg(class, level, fmt, ...): args 1..4 are on the caller's stack */
+    dmlog_add(regs[0], regs[1], (const char *) regs[2], regs[3], stack[0], stack[1], stack[2], stack[3]);
+}
+
 static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t id = regs[0];
@@ -225,6 +257,8 @@ static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 
     uint32_t * buf = (uint32_t *) regs[1];
     uint8_t kind = (pc == PROP_DELIVER_ADDR) ? 'D' : (pc == PROP_REQUEST_CHANGE_ADDR) ? 'R' : 'W';
+    dmlog_add(DM_MARKER, kind, "*** ML-SPY prop write %x val=%x caller=%x", id,
+        buf ? buf[0] : 0xFFFFFFFF, PATCH_HOOK_CALLER(), 0, 0);
     uint32_t val = buf ? buf[0] : 0xFFFFFFFF;
     uint32_t caller = PATCH_HOOK_CALLER();
 
@@ -393,6 +427,11 @@ static void mcm_af_update()
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
         prop_spy_err |= patch_hook_function(PROPMGR_POST_ADDR, PROPMGR_POST_INSN, &propmgr_post_hook, "crop_rec: PropertyMgr post spy") << 12;
         prop_spy_err |= patch_hook_function(SET_PROP_DATA_ADDR, SET_PROP_DATA_INSN, &set_prop_data_hook, "crop_rec: SetPropertyData spy") << 20;
+        if (*(volatile uint32_t *) DEBUGMSG_ADDR == DEBUGMSG_INSN &&
+            patch_hook_function(DEBUGMSG_ADDR, DEBUGMSG_INSN, &debugmsg_hook, "crop_rec: DebugMsg capture") == 0)
+        {
+            dmlog_hooked = 1;
+        }
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2249,6 +2288,7 @@ PROP_HANDLER(PROP_LV_ACTION)
 /* also try when switching zoom modes */
 PROP_HANDLER(PROP_LV_DISPSIZE)
 {
+    dmlog_add(DM_MARKER, 0, "*** ML-SPY DISPSIZE notify %d", buf[0], 0, 0, 0, 0);
     if (mcm_af_log) printf("[PROP] t=%05x DISPSIZE   %d\n", GET_DIGIC_TIMER(), buf[0]);
     update_patch();
 }
@@ -2256,6 +2296,7 @@ PROP_HANDLER(PROP_LV_DISPSIZE)
 PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
 {
     int v = buf[0];
+    dmlog_add(DM_MARKER, 0, "*** ML-SPY AF_SYSTEM notify %d (crop=%d dispsize=%d)", v, video_mode_crop, lv_dispsize, 0, 0);
     if (v != af_last_val)
     {
         int n = af_notify_count;
@@ -2275,6 +2316,7 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
 
 PROP_HANDLER(PROP_VIDEO_MODE)
 {
+    dmlog_add(DM_MARKER, 0, "*** ML-SPY VIDEO_MODE notify %x %x %x %x %x", buf[0], buf[1], buf[2], buf[3], buf[4]);
     if (mcm_af_log) printf("[PROP] t=%05x VIDEO_MODE %x %x %x %x %x\n",
         GET_DIGIC_TIMER(), buf[0], buf[1], buf[2], buf[3], buf[4]);
 }
@@ -2377,6 +2419,85 @@ static MENU_UPDATE_FUNC(setdata_menu_update)
         (int) setdata_af[0].val, setdata_af[0].api, setdata_af[0].ret[0]);
 }
 
+static int in_set(const char * set, char c)
+{
+    for (; *set; set++) if (*set == c) return 1;
+    return 0;
+}
+
+static int fmt_is_safe(const char * fmt)
+{
+    uint32_t f = (uint32_t) fmt;
+    if (!((f >= 0xFF000000) || (f > 0x1000 && f < 0x10000000))) return 0;
+    /* only numeric conversions: %s/%c may point anywhere (or be unsupported) */
+    int n = 0;
+    for (const char * c = fmt; *c && n < 200; c++, n++)
+    {
+        if (*c != '%') continue;
+        c++;
+        while (*c && in_set("0123456789.-+# lhz", *c)) c++;
+        if (!*c || !in_set("dixXuop%", *c)) return 0;
+    }
+    return 1;
+}
+
+static void dmlog_save()
+{
+    dmlog_paused = 1;
+    msleep(50);
+
+    FILE * f = FIO_CreateFile("ML/AFLOG.TXT");
+    if (!f) { dmlog_paused = 0; NotifyBox(2000, "Cannot create ML/AFLOG.TXT"); return; }
+
+    char * line = malloc(512);
+    int w = dmlog_w;
+    int start = (w > DMLOG_N) ? w - DMLOG_N : 0;
+    int written = 0;
+    for (int i = start; i < w; i++)
+    {
+        struct dmlog_entry * e = &dmlog[i % DMLOG_N];
+        int len = snprintf(line, 512, "%05x %3d:%d ", e->t, e->cls == DM_MARKER ? -1 : e->cls, e->lvl);
+        if (fmt_is_safe(e->fmt))
+        {
+            len += snprintf(line + len, 512 - len, e->fmt, e->a[0], e->a[1], e->a[2], e->a[3], e->a[4]);
+        }
+        else
+        {
+            /* raw: format address + string if it looks printable, then the args */
+            uint32_t fa = (uint32_t) e->fmt;
+            int ok = (fa >= 0xFF000000) || (fa > 0x1000 && fa < 0x10000000);
+            char tmp[80] = {0};
+            if (ok)
+            {
+                int k = 0;
+                for (const char * c = e->fmt; *c && k < 78; c++)
+                    tmp[k++] = (*c >= 32 && *c < 127) ? *c : '.';
+            }
+            len += snprintf(line + len, 512 - len, "[raw %x \"%s\"] %x %x %x %x %x", fa, tmp,
+                e->a[0], e->a[1], e->a[2], e->a[3], e->a[4]);
+        }
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+        line[len++] = '\n';
+        FIO_WriteFile(f, line, len);
+        written++;
+    }
+    free(line);
+    FIO_CloseFile(f);
+    dmlog_paused = 0;
+    NotifyBox(3000, "Saved %d lines to ML/AFLOG.TXT", written);
+}
+
+static MENU_SELECT_FUNC(dmlog_save_select)
+{
+    dmlog_save();
+}
+
+static MENU_UPDATE_FUNC(dmlog_menu_update)
+{
+    MENU_SET_VALUE("%d", dmlog_w);
+    MENU_SET_RINFO(dmlog_hooked ? "capturing" : "NOT hooked");
+}
+
 static MENU_UPDATE_FUNC(crop_update)
 {
     if ((CROP_PRESET_MENU && lv) && !is_EOSM && !is_EOSM2)
@@ -2438,6 +2559,13 @@ static struct menu_entry crop_rec_menu[] =
                 .update = prop_log_menu_update,
                 .help   = "Counts: A=AF_SYSTEM V=VIDEO_MODE Z=DISPSIZE writes. Bottom: AF writes\n"
                           "W=ML wait wrapper, R=Canon request, D=deliver; value@caller.\n",
+            },
+            {
+                .name   = "Save Canon log",
+                .select = dmlog_save_select,
+                .update = dmlog_menu_update,
+                .help   = "Writes the last 4096 Canon debug messages (+ ML-SPY markers)\n"
+                          "to ML/AFLOG.TXT. Press SET right after AF switches to Single.\n",
             },
             {
                 .name   = "AF set log",
