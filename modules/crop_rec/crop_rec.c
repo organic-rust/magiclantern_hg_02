@@ -230,6 +230,9 @@ struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a
 static struct dmlog_entry dmlog[DMLOG_N];
 static volatile int dmlog_w = 0;
 static volatile int gmt_trace = 0;          /* AF frame trace: only Gmt classes, repeats collapsed, no freeze */
+static volatile int frz_trace = 0;          /* freeze trace: all classes, repeats collapsed, stops after a LV freeze */
+static volatile int frz_stop_at = 0;        /* 0 = running; else stop when dmlog_w reaches it */
+static uint32_t dm_cls_count[256];          /* messages per class (before collapsing), for the file header */
 static volatile int dmlog_paused = 0;
 static volatile int dmlog_stop_at = 0;      /* 0 = free running; else freeze when dmlog_w reaches it */
 static int dmlog_hooked = 0;
@@ -237,10 +240,13 @@ static int dmlog_hooked = 0;
 static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
 {
     if (dmlog_paused) return;
-    if (gmt_trace)
+    if (gmt_trace || frz_trace)
     {
-        /* 154 GmtState, 196 GmtWaku (+ markers); collapse identical consecutive messages */
-        if (cls != DM_MARKER && cls != 154 && cls != 196) return;
+        /* gmt: 154 GmtState, 196 GmtWaku (+ markers); freeze: everything.
+         * Identical consecutive messages are collapsed. */
+        if (gmt_trace && cls != DM_MARKER && cls != 154 && cls != 196) return;
+        if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
+        if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
         if (w > 0)
         {
@@ -2618,6 +2624,19 @@ static void dmlog_save_as(const char * filename)
     int w = dmlog_w;
     int start = (w > DMLOG_N) ? w - DMLOG_N : 0;
     int written = 0;
+
+    /* header: total entries and messages per class (top classes are the noise to filter) */
+    {
+        int len = snprintf(line, 512, "# entries %d (kept %d). messages per class:", w, w - start);
+        FIO_WriteFile(f, line, len);
+        for (int c = 0; c < 256; c++)
+        {
+            if (!dm_cls_count[c]) continue;
+            len = snprintf(line, 512, " %d:%d", c, dm_cls_count[c]);
+            FIO_WriteFile(f, line, len);
+        }
+        FIO_WriteFile(f, "\n", 1);
+    }
     for (int i = start; i < w; i++)
     {
         struct dmlog_entry * e = &dmlog[i % DMLOG_N];
@@ -2697,17 +2716,138 @@ static void gmt_trace_poll()
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Freeze trace: records every Canon debug message (repeats collapsed), plus
+ * ML markers for recording start/stop, AF frame state changes and a 1 s heartbeat
+ * of the LiveView buffer addresses. When the displayed LV buffer stops changing for
+ * 700 ms while LiveView is shown (= preview freeze), a marker is added and capture
+ * stops shortly after, so the file ends at the freeze. EOS M2 1.0.3 addresses.
+ * --------------------------------------------------------------------------- */
+#define M2_LV_DISPLAY_ADDR  (*(volatile uint32_t *)(0x90494 + 0x12C))  /* YUV422_LV_BUFFER_DISPLAY_ADDR */
+#define M2_EDMAC_LV_ADDR    0xC0F04208                                  /* LV (VRAM) DMA write address */
+#define M2_EDMAC_HD_ADDR    0xC0F04108                                  /* HD (YUV) DMA write address */
+
+static int frz_caught = 0;
+
+static void frz_trace_poll()
+{
+    if (!frz_trace || !is_EOSM2) return;
+
+    static uint32_t last_disp = 0, last_lvdma = 0, last_hddma = 0;
+    static int t_disp = 0, t_lvdma = 0, t_hddma = 0;
+    static int disp_changes = 0;
+    static int last_rec = -1;
+    static int t_hb = 0;
+    static int last_state_key = -12345;
+
+    int now = get_ms_clock();
+    uint32_t disp  = M2_LV_DISPLAY_ADDR;
+    uint32_t lvdma = shamem_read(M2_EDMAC_LV_ADDR);
+    uint32_t hddma = shamem_read(M2_EDMAC_HD_ADDR);
+
+    if (frz_trace == 1)     /* just armed: reset the watchers */
+    {
+        frz_trace = 2;
+        last_disp = disp; last_lvdma = lvdma; last_hddma = hddma;
+        t_disp = t_lvdma = t_hddma = t_hb = now;
+        disp_changes = 0;
+        last_rec = -1;
+        last_state_key = -12345;
+    }
+
+    if (disp  != last_disp)  { last_disp = disp;   t_disp = now; disp_changes++; }
+    if (lvdma != last_lvdma) { last_lvdma = lvdma; t_lvdma = now; }
+    if (hddma != last_hddma) { last_hddma = hddma; t_hddma = now; }
+
+    int rec = RECORDING ? 1 : 0;
+    if (rec != last_rec)
+    {
+        last_rec = rec;
+        dmlog_add(DM_MARKER, 0, "*** ML-SPY RECORDING %d (crop %d, AF %d, servo %d)", rec, video_mode_crop, lv_af_mode, movie_servo_af, 0);
+    }
+
+    /* AF frame state, as in the AF trace */
+    uint32_t gmt = *(volatile uint32_t *)(0x921F4 + 0x14);
+    if (gmt && gmt < 0x10000000)
+    {
+        uint32_t so = *(volatile uint32_t *)(gmt + 0x18);
+        int st  = (so && so < 0x10000000) ? (int) *(volatile uint32_t *)(so + 0x1C) : -1;
+        int sub = *(volatile int *)(gmt + 0x754);
+        int key = (st & 0xFF) | ((sub & 0xFF) << 8) | ((lv_af_mode & 0xF) << 16) | ((movie_servo_af & 1) << 20);
+        if (key != last_state_key)
+        {
+            last_state_key = key;
+            dmlog_add(DM_MARKER, 0, "*** ML-SPY waku st %d sub %d AF %d servo %d", st, sub, lv_af_mode, movie_servo_af, 0);
+        }
+    }
+
+    if (now - t_hb >= 1000)
+    {
+        t_hb = now;
+        dmlog_add(DM_MARKER, 0, "*** ML-SPY hb disp %x lvdma %x hddma %x rec %d", disp, lvdma, hddma, rec, 0);
+    }
+
+    /* freeze: the displayed buffer stops changing while LiveView is on screen */
+    int watching = lv && !gui_menu_shown() && disp_changes >= 3;
+    if (!watching) t_disp = now;
+    if (watching && !frz_stop_at && now - t_disp > 700)
+    {
+        frz_caught = 1;
+        dmlog_add(DM_MARKER, 0, "*** ML-SPY FREEZE: disp %x stuck %d ms; lvdma %x (%d ms), hddma %x", disp, now - t_disp, lvdma, now - t_lvdma, hddma);
+        dmlog_add(DM_MARKER, 0, "*** ML-SPY FREEZE: hddma unchanged %d ms, rec %d, AF %d, servo %d", now - t_hddma, rec, lv_af_mode, movie_servo_af, 0);
+        frz_stop_at = dmlog_w + 300;    /* a little of what follows, then stop */
+    }
+}
+
+/* SET on "Freeze trace": start; SET again: stop and save ML/FRZLOG.TXT */
+static MENU_SELECT_FUNC(frz_trace_select)
+{
+    if (!is_EOSM2) return;
+    if (!frz_trace)
+    {
+        if (gmt_trace) { NotifyBox(2000, "Stop the AF trace first"); return; }
+        if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
+        if (!dmlog_hooked) { NotifyBox(2000, "DebugMsg capture failed (%x)", dm_insn_seen); return; }
+        dmlog_paused = 1;
+        dmlog_stop_at = 0;
+        frz_stop_at = 0;
+        frz_caught = 0;
+        dmlog_w = 0;
+        memset(dm_cls_count, 0, sizeof(dm_cls_count));
+        frz_trace = 1;
+        dmlog_paused = 0;
+    }
+    else
+    {
+        dmlog_save_as("ML/FRZLOG.TXT");
+        frz_trace = 0;
+        frz_stop_at = 0;
+        dmlog_w = 0;
+    }
+}
+
+static MENU_UPDATE_FUNC(frz_trace_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (!frz_trace)       MENU_SET_VALUE("OFF");
+    else if (frz_caught)  MENU_SET_VALUE("FREEZE caught");
+    else                  MENU_SET_VALUE("ON");
+    if (frz_trace) MENU_SET_RINFO("%d", dmlog_w);
+}
+
 /* SET on "AF state (debug)": start the trace; SET again: stop and save ML/GMTLOG.TXT */
 static MENU_SELECT_FUNC(gmt_trace_select)
 {
     if (!is_EOSM2) return;
     if (!gmt_trace)
     {
+        if (frz_trace) { NotifyBox(2000, "Stop the freeze trace first"); return; }
         if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
         if (!dmlog_hooked) { NotifyBox(2000, "DebugMsg capture failed (%x)", dm_insn_seen); return; }
         dmlog_paused = 1;
         dmlog_stop_at = 0;
         dmlog_w = 0;
+        memset(dm_cls_count, 0, sizeof(dm_cls_count));
         gmt_trace = 1;
         dmlog_paused = 0;
     }
@@ -3262,6 +3402,13 @@ static struct menu_entry crop_rec_menu[] =
         .help       = "Live values from Canon's AF frame state machine (GmtWakuState).\n"
                       "SET: start AF trace. SET again: stop and save ML/GMTLOG.TXT.\n",
     },
+    {
+        .name       = "Freeze trace",
+        .update     = frz_trace_update,
+        .select     = frz_trace_select,
+        .help       = "SET: start logging all Canon messages. Stops itself ~0.7 s after a\n"
+                      "LiveView freeze. SET again: save ML/FRZLOG.TXT.\n",
+    },
 };
 
 static int crop_rec_needs_lv_refresh()
@@ -3379,6 +3526,7 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
 
     mcm_af_poll();
     gmt_trace_poll();
+    frz_trace_poll();
 
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
