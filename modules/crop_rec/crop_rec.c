@@ -246,6 +246,54 @@ static void FAST debugmsg_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     dmlog_add(regs[0], regs[1], (const char *) regs[2], regs[3], stack[0], stack[1], stack[2], stack[3]);
 }
 
+/* When ML's CONFIG_LVAPP_HACK_DEBUGMSG is active (EOS M2), DryosDebugMsg starts with
+ * "B hacked_DebugMsg" instead of Canon's code. Take over that branch: record the
+ * message, then call ML's hacked_DebugMsg exactly as before. */
+extern void sync_caches();     /* patch.c */
+typedef void (*debugmsg_fn)(int, int, const char *, ...);
+static debugmsg_fn dm_next = 0;
+static uint32_t dm_insn_seen = 0;
+
+static void my_DebugMsg(int cls, int lvl, const char * fmt,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    /* same register/stack layout as the variadic call, so a0..a4 are the format args */
+    dmlog_add(cls, lvl, fmt, a0, a1, a2, a3, a4);
+    if (dm_next) dm_next(cls, lvl, fmt, a0, a1, a2, a3, a4);
+}
+
+static int install_debugmsg_capture()
+{
+    uint32_t insn = *(volatile uint32_t *) DEBUGMSG_ADDR;
+    dm_insn_seen = insn;
+
+    if (insn == DEBUGMSG_INSN)
+    {
+        /* Canon's original code: a normal logging hook works */
+        return patch_hook_function(DEBUGMSG_ADDR, DEBUGMSG_INSN, &debugmsg_hook, "crop_rec: DebugMsg capture") == 0;
+    }
+
+    if ((insn & 0xFF000000) == 0xEA000000)      /* B <target>: ML's DebugMsg hack */
+    {
+        int32_t off = insn & 0x00FFFFFF;
+        if (off & 0x00800000) off -= 0x01000000;
+        uint32_t target = DEBUGMSG_ADDR + 8 + (off << 2);
+        dm_next = (debugmsg_fn) target;
+
+        uint32_t mine = (uint32_t) &my_DebugMsg;
+        int32_t rel = (int32_t)(mine - DEBUGMSG_ADDR - 8);
+        if (rel < -0x02000000 || rel >= 0x02000000) return 0;   /* out of B range */
+
+        uint32_t old = cli();
+        *(volatile uint32_t *) DEBUGMSG_ADDR = 0xEA000000 | ((rel >> 2) & 0x00FFFFFF);
+        sei(old);
+        sync_caches();
+        return 1;
+    }
+
+    return 0;
+}
+
 static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t id = regs[0];
@@ -427,11 +475,7 @@ static void mcm_af_update()
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
         prop_spy_err |= patch_hook_function(PROPMGR_POST_ADDR, PROPMGR_POST_INSN, &propmgr_post_hook, "crop_rec: PropertyMgr post spy") << 12;
         prop_spy_err |= patch_hook_function(SET_PROP_DATA_ADDR, SET_PROP_DATA_INSN, &set_prop_data_hook, "crop_rec: SetPropertyData spy") << 20;
-        if (*(volatile uint32_t *) DEBUGMSG_ADDR == DEBUGMSG_INSN &&
-            patch_hook_function(DEBUGMSG_ADDR, DEBUGMSG_INSN, &debugmsg_hook, "crop_rec: DebugMsg capture") == 0)
-        {
-            dmlog_hooked = 1;
-        }
+        dmlog_hooked = install_debugmsg_capture();
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2495,7 +2539,8 @@ static MENU_SELECT_FUNC(dmlog_save_select)
 static MENU_UPDATE_FUNC(dmlog_menu_update)
 {
     MENU_SET_VALUE("%d", dmlog_w);
-    MENU_SET_RINFO(dmlog_hooked ? "capturing" : "NOT hooked");
+    if (dmlog_hooked) MENU_SET_RINFO("capturing");
+    else              MENU_SET_RINFO("NOT hooked %x", dm_insn_seen);
 }
 
 static MENU_UPDATE_FUNC(crop_update)
