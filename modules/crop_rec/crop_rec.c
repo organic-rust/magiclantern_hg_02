@@ -198,6 +198,13 @@ static volatile int af_last_val = -1;
 static volatile int dlvarr_af_count = 0;
 static uint32_t dlvarr_af_args[6];               /* r0..r3, stack[0], caller (first hit) */
 
+/* PropertyMgr message poster: every PropertyMgr API funnels through it.
+ * r2 = message type, r3 = payload (contains the property ID somewhere in the first words) */
+#define PROPMGR_POST_ADDR   0xFF12D8A4
+#define PROPMGR_POST_INSN   0xE92D4008      /* push {r3, lr} */
+static volatile int post_af_count = 0;
+static struct { uint32_t type, api, ret[4], w[5]; } post_af[2];    /* [0] first, [1] latest */
+
 static int prop_spy_active = 0;
 static int prop_spy_err = 0;
 
@@ -231,6 +238,42 @@ static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     pwlog[w % PWLOG_N].kind   = (pc == PROP_DELIVER_ADDR) ? 'D' : (pc == PROP_REQUEST_CHANGE_ADDR) ? 'R' : 'W';
     pwlog[w % PWLOG_N].which  = which;
     pwlog_w = w + 1;
+}
+
+static int FAST looks_like_return_addr(uint32_t v)
+{
+    if (v & 3) return 0;
+    int rom = (v >= 0xFF000000 && v < 0xFFD00000);
+    int ram = (v >= 0x1904 && v < 0xB89A0);
+    if (!rom && !ram) return 0;
+    uint32_t prev = *(volatile uint32_t *)(v - 4);
+    return ((prev & 0x0F000000) == 0x0B000000) ||          /* BL / BLcc */
+           ((prev & 0x0FFFFFF0) == 0x012FFF30);            /* BLX reg */
+}
+
+static void FAST propmgr_post_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * payload = (uint32_t *) regs[3];
+    if (!payload || ((uint32_t) payload & 3) || (uint32_t) payload > 0x10000000) return;
+
+    int hit = 0;
+    for (int i = 0; i < 5; i++)
+        if (payload[i] == PROP_LIVE_VIEW_AF_SYSTEM) hit = 1;
+    if (!hit) return;
+
+    int n = post_af_count;
+    int k = (n == 0) ? 0 : 1;
+    post_af[k].type = regs[2];
+    post_af[k].api  = PATCH_HOOK_CALLER();      /* which PropertyMgr API posted it */
+    for (int i = 0; i < 5; i++) post_af[k].w[i] = payload[i];
+
+    /* walk the stack for the first 4 return addresses: the API's caller and up */
+    int r = 0;
+    for (int i = 0; i < 48 && r < 4; i++)
+        if (looks_like_return_addr(stack[i])) post_af[k].ret[r++] = stack[i] - 4;
+    for (; r < 4; r++) post_af[k].ret[r] = 0;
+
+    post_af_count = n + 1;
 }
 
 static void FAST deliver_array_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -326,6 +369,7 @@ static void mcm_af_update()
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
+        prop_spy_err |= patch_hook_function(PROPMGR_POST_ADDR, PROPMGR_POST_INSN, &propmgr_post_hook, "crop_rec: PropertyMgr post spy") << 12;
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2271,6 +2315,23 @@ static MENU_UPDATE_FUNC(prop_log_menu_update)
     }
 }
 
+static MENU_UPDATE_FUNC(post_log_menu_update)
+{
+    /* latest PropertyMgr message carrying AF_SYSTEM: type, payload words, posting API, call chain */
+    int n = post_af_count;
+    int k = (n > 1) ? 1 : 0;
+    MENU_SET_VALUE("%d", n);
+    if (n == 0)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "no PropertyMgr message with AF_SYSTEM yet");
+        return;
+    }
+    MENU_SET_RINFO("t%d", post_af[k].type);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%x %x %x %x %x|%x<%x<%x<%x<%x",
+        post_af[k].w[0], post_af[k].w[1], post_af[k].w[2], post_af[k].w[3], post_af[k].w[4],
+        post_af[k].api, post_af[k].ret[0], post_af[k].ret[1], post_af[k].ret[2], post_af[k].ret[3]);
+}
+
 static MENU_UPDATE_FUNC(crop_update)
 {
     if ((CROP_PRESET_MENU && lv) && !is_EOSM && !is_EOSM2)
@@ -2332,6 +2393,10 @@ static struct menu_entry crop_rec_menu[] =
                 .update = prop_log_menu_update,
                 .help   = "Counts: A=AF_SYSTEM V=VIDEO_MODE Z=DISPSIZE writes. Bottom: AF writes\n"
                           "W=ML wait wrapper, R=Canon request, D=deliver; value@caller.\n",
+            },
+            {
+                .name   = "AF msg log",
+                .update = post_log_menu_update,
             },
             {
                 .name   = "bitdepth",
