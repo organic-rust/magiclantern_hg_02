@@ -184,6 +184,9 @@ static int is_mcm_preset(int preset);
 static struct { uint32_t caller; uint32_t val; uint8_t kind, which; } pwlog[PWLOG_N];
 static volatile int pwlog_w = 0;
 static int pwlog_r = 0;
+static volatile int pw_count_af = 0, pw_count_vm = 0, pw_count_zoom = 0;
+/* AF writes kept separately so other writes can't push them out: first 2 + last 2 */
+static struct { uint32_t caller; uint32_t val; uint8_t kind; } afw_first[2], afw_last[2];
 static int prop_spy_active = 0;
 static int prop_spy_err = 0;
 
@@ -197,6 +200,20 @@ static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (!which) return;
 
     uint32_t * buf = (uint32_t *) regs[1];
+    uint8_t kind = (pc == PROP_DELIVER_ADDR) ? 'D' : (pc == PROP_REQUEST_CHANGE_ADDR) ? 'R' : 'W';
+    uint32_t val = buf ? buf[0] : 0xFFFFFFFF;
+    uint32_t caller = PATCH_HOOK_CALLER();
+
+    if (which == 'A')
+    {
+        int n = pw_count_af;
+        if (n < 2) { afw_first[n].caller = caller; afw_first[n].val = val; afw_first[n].kind = kind; }
+        afw_last[n & 1].caller = caller; afw_last[n & 1].val = val; afw_last[n & 1].kind = kind;
+        pw_count_af = n + 1;
+    }
+    else if (which == 'V') pw_count_vm++;
+    else pw_count_zoom++;
+
     int w = pwlog_w;
     pwlog[w % PWLOG_N].caller = PATCH_HOOK_CALLER();
     pwlog[w % PWLOG_N].val    = buf ? buf[0] : 0xFFFFFFFF;
@@ -318,7 +335,8 @@ static void mcm_af_poll()
     while (mcm_af_log && pwlog_r != pwlog_w)
     {
         int i = pwlog_r % PWLOG_N;
-        printf("[%c] %s val=%x from %08x\n", pwlog[i].kind,
+        char kind[2] = { pwlog[i].kind, 0 };
+        printf("[%s] %s val=%x from %08x\n", kind,
             pwlog[i].which == 'A' ? "AF_SYSTEM " : pwlog[i].which == 'V' ? "VIDEO_MODE" : "DISPSIZE  ",
             pwlog[i].val, pwlog[i].caller);
         pwlog_r++;
@@ -2155,28 +2173,38 @@ static MENU_UPDATE_FUNC(mcm_af_menu_update)
 
 }
 
+static void fmt_write(char * out, int size, uint8_t kind, uint8_t which, uint32_t val, uint32_t caller)
+{
+    /* no %c: ML's snprintf doesn't handle it */
+    char k[3] = { kind ? kind : '?', which ? which : '?', 0 };
+    snprintf(out, size, "%s%d@%x", k, (int)(val & 0xFF), caller);
+}
+
 static MENU_UPDATE_FUNC(prop_log_menu_update)
 {
-    /* last 3 writes to AF_SYSTEM (A) / VIDEO_MODE (V) / DISPSIZE (Z), newest first.
-     * kind: W = ML prop_request_change_wait, R = Canon prop_request_change, D = prop_deliver */
-    char tmp[3][24] = {{0}};
-    int n = 0;
-    for (int k = pwlog_w - 1; k >= 0 && k >= pwlog_w - PWLOG_N && n < 3; k--)
-    {
-        int i = k % PWLOG_N;
-        snprintf(tmp[n], sizeof(tmp[n]), "%c%c%x@%x", pwlog[i].kind, pwlog[i].which,
-            (int)(pwlog[i].val & 0xFF), pwlog[i].caller);
-        n++;
-    }
-    int af_writes = 0;
-    for (int k = pwlog_w - 1; k >= 0 && k >= pwlog_w - PWLOG_N; k--)
-        if (pwlog[k % PWLOG_N].which == 'A') af_writes++;
+    char a[4][24] = {{0}};
+    int n = pw_count_af;
+    if (n > 0) fmt_write(a[0], sizeof(a[0]), afw_first[0].kind, 'A', afw_first[0].val, afw_first[0].caller);
+    if (n > 1) fmt_write(a[1], sizeof(a[1]), afw_first[1].kind, 'A', afw_first[1].val, afw_first[1].caller);
+    if (n > 2) fmt_write(a[2], sizeof(a[2]), afw_last[(n - 2) & 1].kind, 'A', afw_last[(n - 2) & 1].val, afw_last[(n - 2) & 1].caller);
+    if (n > 3) fmt_write(a[3], sizeof(a[3]), afw_last[(n - 1) & 1].kind, 'A', afw_last[(n - 1) & 1].val, afw_last[(n - 1) & 1].caller);
 
-    MENU_SET_VALUE("%d", pwlog_w);
-    MENU_SET_RINFO("AF writes:%d", af_writes);
-    MENU_SET_WARNING(MENU_WARN_INFO, "%s %s %s %s",
-        prop_spy_active ? "" : prop_spy_err ? "spy ERR" : "spy off",
-        n > 0 ? tmp[0] : "none", tmp[1], tmp[2]);
+    MENU_SET_VALUE("A%d V%d Z%d", pw_count_af, pw_count_vm, pw_count_zoom);
+    MENU_SET_RINFO("AF=%d", lv_af_mode);
+
+    if (!prop_spy_active)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "spy %s (err %x)", prop_spy_err ? "ERR" : "off", prop_spy_err);
+    }
+    else if (n == 0)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "no AF_SYSTEM writes seen");
+    }
+    else
+    {
+        /* first two AF writes, then (if more) the last two */
+        MENU_SET_WARNING(MENU_WARN_INFO, "AF: %s %s %s %s", a[0], a[1], a[2], a[3]);
+    }
 }
 
 static MENU_UPDATE_FUNC(crop_update)
@@ -2238,7 +2266,7 @@ static struct menu_entry crop_rec_menu[] =
             {
                 .name   = "Prop write log",
                 .update = prop_log_menu_update,
-                .help   = "Last writes to AF_SYSTEM(A) / VIDEO_MODE(V) / DISPSIZE(Z).\n"
+                .help   = "Counts: A=AF_SYSTEM V=VIDEO_MODE Z=DISPSIZE writes. Bottom: AF writes\n"
                           "W=ML wait wrapper, R=Canon request, D=deliver; value@caller.\n",
             },
             {
