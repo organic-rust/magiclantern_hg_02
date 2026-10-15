@@ -321,6 +321,15 @@ static int pstate_hook_err = -1;
 #define NOFACE_DZOOM_BRANCH_NEW   0xEA00001E    /* b   FF18F6DC (MULTI AF) */
 static int noface_patched = 0;
 
+/* gmtAFModeTrackFromFace (FF193AC8): Servo AF with Face+Tracking and no face normally enters
+ * tracking (waku state 12, wide area). With Digital zoom active and the "DZ just engaged" flag
+ * [gmt+0xF30] set (by PROP_MOVIE_PARAM), it instead resets to face state 0 with the small box.
+ * Always take the normal track start. */
+#define TRACK_DZOOM_BRANCH_ADDR   0xFF193B48
+#define TRACK_DZOOM_BRANCH_ORIG   0x0A000014    /* beq FF193BA0 (normal track start) */
+#define TRACK_DZOOM_BRANCH_NEW    0xEA000014    /* b   FF193BA0 */
+static int track_patched = 0;
+
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint32_t * m = (uint32_t *) regs[1];
@@ -529,6 +538,16 @@ static void mcm_af_update()
     {
         unpatch_memory(NOFACE_DZOOM_BRANCH_ADDR);
         noface_patched = 0;
+    }
+    if (want_noface && !track_patched)
+    {
+        track_patched = (patch_instruction(TRACK_DZOOM_BRANCH_ADDR, TRACK_DZOOM_BRANCH_ORIG,
+            TRACK_DZOOM_BRANCH_NEW, "crop_rec: Face+Tracking servo track start in Digital zoom") == 0);
+    }
+    else if (!want_noface && track_patched)
+    {
+        unpatch_memory(TRACK_DZOOM_BRANCH_ADDR);
+        track_patched = 0;
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2466,7 +2485,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d", lv_af_mode, video_mode_crop, noface_patched);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d tr=%d", lv_af_mode, video_mode_crop, noface_patched, track_patched);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
