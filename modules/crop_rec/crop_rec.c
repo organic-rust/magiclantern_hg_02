@@ -226,9 +226,10 @@ static int prop_spy_err = 0;
 #define DEBUGMSG_INSN   0xE92D000F      /* push {r0-r3} */
 #define DMLOG_N         4096
 #define DM_MARKER       0xFFFF
-struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a[5]; };
+struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a[5]; uint32_t rep; };
 static struct dmlog_entry dmlog[DMLOG_N];
 static volatile int dmlog_w = 0;
+static volatile int gmt_trace = 0;          /* AF frame trace: only Gmt classes, repeats collapsed, no freeze */
 static volatile int dmlog_paused = 0;
 static volatile int dmlog_stop_at = 0;      /* 0 = free running; else freeze when dmlog_w reaches it */
 static int dmlog_hooked = 0;
@@ -236,6 +237,28 @@ static int dmlog_hooked = 0;
 static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
 {
     if (dmlog_paused) return;
+    if (gmt_trace)
+    {
+        /* 154 GmtState, 196 GmtWaku (+ markers); collapse identical consecutive messages */
+        if (cls != DM_MARKER && cls != 154 && cls != 196) return;
+        int w = dmlog_w;
+        if (w > 0)
+        {
+            struct dmlog_entry * p = &dmlog[(w - 1) % DMLOG_N];
+            if (p->fmt == fmt && p->cls == cls && p->a[0] == a0 && p->a[1] == a1 &&
+                p->a[2] == a2 && p->a[3] == a3 && p->a[4] == a4)
+            {
+                p->rep++;
+                return;
+            }
+        }
+        struct dmlog_entry * e = &dmlog[w % DMLOG_N];
+        e->t = GET_DIGIC_TIMER();
+        e->cls = cls; e->lvl = lvl; e->fmt = fmt; e->rep = 0;
+        e->a[0] = a0; e->a[1] = a1; e->a[2] = a2; e->a[3] = a3; e->a[4] = a4;
+        dmlog_w = w + 1;
+        return;
+    }
     /* keep only AF / face / property / LiveView-GUI related classes (and our markers):
      * 1 prop, 131 GUI LV, 143 dcs, 154 GmtState, 170 lvface, 184 AF calc, 196 GmtWaku */
     if (cls != DM_MARKER && cls != 1 && cls != 131 && cls != 143 && cls != 154 &&
@@ -244,7 +267,7 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
     if (dmlog_stop_at && w >= dmlog_stop_at) return;    /* frozen after an AF change */
     struct dmlog_entry * e = &dmlog[w % DMLOG_N];
     e->t = GET_DIGIC_TIMER();
-    e->cls = cls; e->lvl = lvl; e->fmt = fmt;
+    e->cls = cls; e->lvl = lvl; e->fmt = fmt; e->rep = 0;
     e->a[0] = a0; e->a[1] = a1; e->a[2] = a2; e->a[3] = a3; e->a[4] = a4;
     dmlog_w = w + 1;
 }
@@ -543,7 +566,7 @@ static void mcm_af_update()
     {
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
-        dmlog_hooked = install_debugmsg_capture();
+        if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2420,7 +2443,7 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
     dmlog_add(DM_MARKER, 0, "*** ML-SPY AF_SYSTEM notify %d (crop=%d dispsize=%d)", v, video_mode_crop, lv_dispsize, 0, 0);
     /* freeze the Canon log on the forced switch: any AF notification while Digital zoom is on
      * (the forced 1 can arrive as the very first notification, so don't require a known old value) */
-    if ((video_mode_crop || (af_last_val >= 0 && v != af_last_val)) && !dmlog_stop_at)
+    if ((video_mode_crop || (af_last_val >= 0 && v != af_last_val)) && !dmlog_stop_at && !gmt_trace)
     {
         dmlog_stop_at = dmlog_w + 3000;     /* keep some lead-up, mostly what follows */
     }
@@ -2583,13 +2606,13 @@ static int fmt_is_safe(const char * fmt)
     return 1;
 }
 
-static void dmlog_save()
+static void dmlog_save_as(const char * filename)
 {
     dmlog_paused = 1;
     msleep(50);
 
-    FILE * f = FIO_CreateFile("ML/AFLOG.TXT");
-    if (!f) { dmlog_paused = 0; NotifyBox(2000, "Cannot create ML/AFLOG.TXT"); return; }
+    FILE * f = FIO_CreateFile(filename);
+    if (!f) { dmlog_paused = 0; NotifyBox(2000, "Cannot create %s", filename); return; }
 
     char * line = malloc(512);
     int w = dmlog_w;
@@ -2619,6 +2642,7 @@ static void dmlog_save()
                 e->a[0], e->a[1], e->a[2], e->a[3], e->a[4]);
         }
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+        if (e->rep && len < 480) len += snprintf(line + len, 512 - len, "  (x%d)", e->rep + 1);
         line[len++] = '\n';
         FIO_WriteFile(f, line, len);
         written++;
@@ -2627,7 +2651,12 @@ static void dmlog_save()
     FIO_CloseFile(f);
     dmlog_paused = 0;
     dmlog_stop_at = 0;      /* re-arm for the next AF change */
-    NotifyBox(3000, "Saved %d lines to ML/AFLOG.TXT", written);
+    NotifyBox(3000, "Saved %d lines to %s", written, filename);
+}
+
+static void dmlog_save()
+{
+    dmlog_save_as("ML/AFLOG.TXT");
 }
 
 static MENU_SELECT_FUNC(dmlog_save_select)
@@ -2648,6 +2677,49 @@ static MENU_UPDATE_FUNC(dmlog_menu_update)
  * gmt 'this' is stored at 0x921F4+0x14; its StateObject at gmt+0x18 (current state at +0x1C).
  * 0x754: face sub-mode used by gmtStartServoAFFaceTrack; 0x1AC: LvMode index;
  * 0x744: magnify; 0x7C0: MF flag; per-mode entry (0x34 bytes) +0xC0: Digital zoom flag. */
+/* AF frame trace: state changes are logged as markers from the polling CBR */
+static void gmt_trace_poll()
+{
+    if (!gmt_trace || !is_EOSM2) return;
+    uint32_t gmt = *(volatile uint32_t *)(0x921F4 + 0x14);
+    if (!gmt || gmt > 0x10000000) return;
+    uint32_t so = *(volatile uint32_t *)(gmt + 0x18);
+    int st   = (so && so < 0x10000000) ? (int) *(volatile uint32_t *)(so + 0x1C) : -1;
+    int sub  = *(volatile int *)(gmt + 0x754);
+    int mode = *(volatile int *)(gmt + 0x1AC);
+    int dz   = (mode >= 0 && mode < 8) ? *(volatile int *)(gmt + mode * 0x34 + 0xC0) : -1;
+    static int last = -12345;
+    int key = (st & 0xFF) | ((sub & 0xFF) << 8) | ((dz & 0xFF) << 16) | ((movie_servo_af & 1) << 24) | ((lv_af_mode & 0xF) << 26);
+    if (key != last)
+    {
+        last = key;
+        dmlog_add(DM_MARKER, 0, "*** ML-SPY waku st %d sub %d dz %d servo %d AF %d", st, sub, dz, movie_servo_af, lv_af_mode);
+    }
+}
+
+/* SET on "AF state (debug)": start the trace; SET again: stop and save ML/GMTLOG.TXT */
+static MENU_SELECT_FUNC(gmt_trace_select)
+{
+    if (!is_EOSM2) return;
+    if (!gmt_trace)
+    {
+        if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
+        if (!dmlog_hooked) { NotifyBox(2000, "DebugMsg capture failed (%x)", dm_insn_seen); return; }
+        dmlog_paused = 1;
+        dmlog_stop_at = 0;
+        dmlog_w = 0;
+        gmt_trace = 1;
+        dmlog_paused = 0;
+    }
+    else
+    {
+        gmt_trace_poll();
+        dmlog_save_as("ML/GMTLOG.TXT");
+        gmt_trace = 0;
+        dmlog_w = 0;
+    }
+}
+
 static MENU_UPDATE_FUNC(gmt_state_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
@@ -2661,7 +2733,8 @@ static MENU_UPDATE_FUNC(gmt_state_update)
     int mf   = *(volatile int *)(gmt + 0x7C0);
     int dz   = (mode >= 0 && mode < 8) ? *(volatile int *)(gmt + mode * 0x34 + 0xC0) : -1;
     MENU_SET_VALUE("st %d sub %d", st, sub);
-    MENU_SET_RINFO("AF=%d servo=%d", lv_af_mode, movie_servo_af);
+    if (gmt_trace) MENU_SET_RINFO("TRACE %d", dmlog_w);
+    else MENU_SET_RINFO("AF=%d servo=%d", lv_af_mode, movie_servo_af);
     MENU_SET_WARNING(MENU_WARN_INFO, "waku state %d, 0x754=%d, mode=%d, mag=%x, mf=%d, dzflag=%d, crop=%d",
         st, sub, mode, mag, mf, dz, video_mode_crop);
 }
@@ -3184,9 +3257,10 @@ static struct menu_entry crop_rec_menu[] =
     {
         .name       = "AF state (debug)",
         .update     = gmt_state_update,
+        .select     = gmt_trace_select,
         .depends_on = DEP_LIVEVIEW,
         .help       = "Live values from Canon's AF frame state machine (GmtWakuState).\n"
-                      "Temporary, for the mcm AF work.\n",
+                      "SET: start AF trace. SET again: stop and save ML/GMTLOG.TXT.\n",
     },
 };
 
@@ -3304,6 +3378,7 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     static int lv_dirty = 1;
 
     mcm_af_poll();
+    gmt_trace_poll();
 
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
