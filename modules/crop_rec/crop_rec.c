@@ -227,12 +227,15 @@ struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a
 static struct dmlog_entry dmlog[DMLOG_N];
 static volatile int dmlog_w = 0;
 static volatile int dmlog_paused = 0;
+static volatile int dmlog_stop_at = 0;      /* 0 = free running; else freeze when dmlog_w reaches it */
 static int dmlog_hooked = 0;
 
 static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
 {
     if (dmlog_paused) return;
+    if (cls == 21) return;                  /* engio register writes: flood the buffer every frame */
     int w = dmlog_w;
+    if (dmlog_stop_at && w >= dmlog_stop_at) return;    /* frozen after an AF change */
     struct dmlog_entry * e = &dmlog[w % DMLOG_N];
     e->t = GET_DIGIC_TIMER();
     e->cls = cls; e->lvl = lvl; e->fmt = fmt;
@@ -2343,6 +2346,10 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
     dmlog_add(DM_MARKER, 0, "*** ML-SPY AF_SYSTEM notify %d (crop=%d dispsize=%d)", v, video_mode_crop, lv_dispsize, 0, 0);
     if (v != af_last_val)
     {
+        if (af_last_val >= 0 && !dmlog_stop_at)
+        {
+            dmlog_stop_at = dmlog_w + 256;  /* keep the lead-up, plus a bit after */
+        }
         int n = af_notify_count;
         int k = (n == 0) ? 0 : 1;
         af_notify[k].old  = af_last_val;
@@ -2528,6 +2535,7 @@ static void dmlog_save()
     free(line);
     FIO_CloseFile(f);
     dmlog_paused = 0;
+    dmlog_stop_at = 0;      /* re-arm for the next AF change */
     NotifyBox(3000, "Saved %d lines to ML/AFLOG.TXT", written);
 }
 
@@ -2539,7 +2547,9 @@ static MENU_SELECT_FUNC(dmlog_save_select)
 static MENU_UPDATE_FUNC(dmlog_menu_update)
 {
     MENU_SET_VALUE("%d", dmlog_w);
-    if (dmlog_hooked) MENU_SET_RINFO("capturing");
+    if (dmlog_hooked && dmlog_stop_at && dmlog_w >= dmlog_stop_at) MENU_SET_RINFO("FROZEN (AF changed)");
+    else if (dmlog_hooked && dmlog_stop_at) MENU_SET_RINFO("AF changed...");
+    else if (dmlog_hooked) MENU_SET_RINFO("capturing");
     else              MENU_SET_RINFO("NOT hooked %x", dm_insn_seen);
 }
 
