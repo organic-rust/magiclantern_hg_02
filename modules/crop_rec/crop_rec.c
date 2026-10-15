@@ -248,6 +248,7 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
         if (gmt_trace && cls != DM_MARKER && cls != 154 && cls != 196) return;
         if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
         if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != saf_trace_cls) return;
+        if (frz_trace && cls == 21) { dm_cls_count[21]++; return; }   /* register-write spam (~6000/s in mcm) */
         if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
         if (w > 0)
@@ -2906,7 +2907,7 @@ static MENU_SELECT_FUNC(saf_debug_select)
     if (!saf_debug)
     {
         saf_debug_old = SAF_DEBUG_FLAGS;
-        SAF_DEBUG_FLAGS = saf_debug_old | 0x187;
+        SAF_DEBUG_FLAGS = saf_debug_old | 0x85;    /* setup/start, DefocusResult, per-area results */
         saf_debug = 1;
         saf_trace_cls = SAF_DEBUG_CLASS & 0xFF;
     }
