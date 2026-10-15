@@ -236,7 +236,10 @@ static int dmlog_hooked = 0;
 static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
 {
     if (dmlog_paused) return;
-    if (cls == 21) return;                  /* engio register writes: flood the buffer every frame */
+    /* keep only AF / face / property / LiveView-GUI related classes (and our markers):
+     * 1 prop, 131 GUI LV, 143 dcs, 154 GmtState, 170 lvface, 184 AF calc, 196 GmtWaku */
+    if (cls != DM_MARKER && cls != 1 && cls != 131 && cls != 143 && cls != 154 &&
+        cls != 170 && cls != 184 && cls != 196) return;
     int w = dmlog_w;
     if (dmlog_stop_at && w >= dmlog_stop_at) return;    /* frozen after an AF change */
     struct dmlog_entry * e = &dmlog[w % DMLOG_N];
@@ -2393,7 +2396,7 @@ PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
      * (the forced 1 can arrive as the very first notification, so don't require a known old value) */
     if ((video_mode_crop || (af_last_val >= 0 && v != af_last_val)) && !dmlog_stop_at)
     {
-        dmlog_stop_at = dmlog_w + 256;      /* keep the lead-up, plus a bit after */
+        dmlog_stop_at = dmlog_w + 3000;     /* keep some lead-up, mostly what follows */
     }
     if (v != af_last_val)
     {
