@@ -364,6 +364,14 @@ static int dzflag_patched = 0;
 #define GMT_TVAF_DZ_LOAD_ORIG     0xE5941128    /* ldr r1, [r4, #0x128] */
 #define GMT_TVAF_DZ_LOAD_NEW      0xE5951010    /* ldr r1, [r5, #0x10]  */
 static int tvafdz_patched = 0;
+
+/* ...and right after that setup (FF17D4FC): "if the stored flag was 0 before (Digital zoom just
+ * engaged): set [0xF30], post Gmt events 10 and 0" - that resets the AF frame to the Digital zoom
+ * centre box. With the flag always stored as 0 it would fire on every PROP_MOVIE_PARAM, so skip it. */
+#define GMT_DZ_ENGAGE_BRANCH_ADDR 0xFF17D4FC
+#define GMT_DZ_ENGAGE_BRANCH_ORIG 0x1A000006    /* bne FF17D51C */
+#define GMT_DZ_ENGAGE_BRANCH_NEW  0xEA000006    /* b   FF17D51C */
+static int dzengage_patched = 0;
 static int dzflag_err = 0;     /* don't retry a failed patch every poll */
 
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -580,7 +588,9 @@ static void mcm_af_update()
     if (want_noface && !dzflag_patched && !dzflag_err)
     {
         /* TVAF setup patch first, so the handler never runs with only half of the change */
-        tvafdz_patched = (patch_instruction(GMT_TVAF_DZ_LOAD_ADDR, GMT_TVAF_DZ_LOAD_ORIG,
+        dzengage_patched = (patch_instruction(GMT_DZ_ENGAGE_BRANCH_ADDR, GMT_DZ_ENGAGE_BRANCH_ORIG,
+            GMT_DZ_ENGAGE_BRANCH_NEW, "crop_rec: skip Gmt Digital zoom engage reset (mcm Face+Tracking)") == 0);
+        tvafdz_patched = dzengage_patched && (patch_instruction(GMT_TVAF_DZ_LOAD_ADDR, GMT_TVAF_DZ_LOAD_ORIG,
             GMT_TVAF_DZ_LOAD_NEW, "crop_rec: TVAF keeps Digital zoom setup (mcm Face+Tracking)") == 0);
         if (tvafdz_patched)
         {
@@ -598,6 +608,11 @@ static void mcm_af_update()
     {
         unpatch_memory(GMT_TVAF_DZ_LOAD_ADDR);
         tvafdz_patched = 0;
+    }
+    if (!dzflag_patched && dzengage_patched)
+    {
+        unpatch_memory(GMT_DZ_ENGAGE_BRANCH_ADDR);
+        dzengage_patched = 0;
     }
     if (dzflag_patched)
     {
@@ -2544,7 +2559,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d%d", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched, dzengage_patched);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
