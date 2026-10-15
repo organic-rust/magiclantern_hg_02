@@ -380,6 +380,17 @@ static int dzflag_errcode = 0;  /* patch error bits | which step (<<8) */
 #define GMT_DZ_ENGAGE_BRANCH_ORIG 0x1A000006    /* bne FF17D51C */
 #define GMT_DZ_ENGAGE_BRANCH_NEW  0xEA000006    /* b   FF17D51C */
 static int dzengage_patched = 0;
+
+/* GMT_CONTINUOUSAF_Start (FF197F48) picks the contrast AF window from the face sub-mode:
+ * sub 6 (Servo, no face, wide) -> Win 4 "MULTI". With the sensor in Digital zoom readout that
+ * start freezes LiveView (trace: MULTI Win:4, then no AF results and no more face-detect frames).
+ * Use the sub 0/7 entry instead (window 0, "TRACK" start, what stock mcm does). The wide area
+ * still comes from the AF results afterwards ("Tracking LCR Win" -> SetTrackingFrame 64), as in
+ * the trace after re-entering LiveView, which ran fine. */
+#define CONTAF_SUB6_ENTRY_ADDR    0xFF198028
+#define CONTAF_SUB6_ENTRY_ORIG    0xEA000007    /* b FF19804C (Win 4) */
+#define CONTAF_SUB6_ENTRY_NEW     0xEA000045    /* b FF198144 (Win 0) */
+static int contaf_patched = 0;
 static int dzflag_err = 0;     /* don't retry a failed patch every poll */
 
 static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -616,6 +627,13 @@ static void mcm_af_update()
         }
         if (tvafdz_patched)
         {
+            e = patch_instruction(CONTAF_SUB6_ENTRY_ADDR, CONTAF_SUB6_ENTRY_ORIG,
+                CONTAF_SUB6_ENTRY_NEW, "crop_rec: Servo AF start window 0 (mcm Face+Tracking)");
+            contaf_patched = (e == 0);
+            if (e) dzflag_errcode = e | 0x400;
+        }
+        if (contaf_patched)
+        {
             e = patch_instruction(GMT_DZFLAG_LOAD_ADDR, GMT_DZFLAG_LOAD_ORIG,
                 GMT_DZFLAG_LOAD_NEW, "crop_rec: Gmt ignores Digital zoom (mcm Face+Tracking)");
             dzflag_patched = (e == 0);
@@ -633,6 +651,11 @@ static void mcm_af_update()
         unpatch_memory(GMT_TVAF_DZ_SKIP_ADDR);
         unpatch_memory(GMT_TVAF_DZ_LOAD_ADDR);
         tvafdz_patched = 0;
+    }
+    if (!dzflag_patched && contaf_patched)
+    {
+        unpatch_memory(CONTAF_SUB6_ENTRY_ADDR);
+        contaf_patched = 0;
     }
     if (!dzflag_patched && dzengage_patched)
     {
@@ -2584,7 +2607,7 @@ static MENU_UPDATE_FUNC(mcm_af_choice_update)
 
 static MENU_UPDATE_FUNC(mcm_af_menu_update)
 {
-    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d%d e%x", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched, dzengage_patched, dzflag_errcode);
+    MENU_SET_RINFO("AF=%d crop=%d nf=%d dz=%d%d%d%d e%x", lv_af_mode, video_mode_crop, noface_patched, dzflag_patched, tvafdz_patched, dzengage_patched, contaf_patched, dzflag_errcode);
     MENU_SET_WARNING(MENU_WARN_INFO,
         "pstate:%s filt:%d tgt:%d spells:%d af:%d rw:%d dlv:%d",
         pstate_hook_err == 0 ? "on" : pstate_hook_err < 0 ? "off" : "ERR",
