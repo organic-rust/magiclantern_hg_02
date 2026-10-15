@@ -376,6 +376,34 @@ struct saf_snap {
 };
 static struct saf_snap saf_snap[2];
 
+/* SAF_DefocusResult (FF27D608): sends the phase-detect result as a 34-byte property:
+ * 10 areas x big-endian s16 defocus (bytes 0..19), 10 x u8 reliability (20..29),
+ * focus position (30..31), 2 more bytes. In mcm the readings are noise (D0 jumps
+ * sign every frame while the lens moves steadily; other areas invalid), so optionally
+ * mark every area unreliable there and let AF work from contrast only. */
+#define SAF_RESULT_ADDR     0xFF27D608
+#define SAF_RESULT_INSN     0xE92D4070      /* push {r4, r5, r6, lr} */
+static int saf_result_hook_err = -1;
+static int saf_pd_ignore = 0;               /* 0 = Canon, 1 = ignore phase detection in mcm */
+static volatile int saf_res_count = 0;
+static volatile int saf_res_d0 = 0, saf_res_r0 = 0, saf_res_valid = 0;
+
+static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint8_t * pk = (uint8_t *) regs[0];
+    if (!pk || (uint32_t) pk > 0x10000000) return;
+    saf_res_count++;
+    saf_res_d0 = (int16_t)((pk[0] << 8) | pk[1]);
+    saf_res_r0 = pk[20];
+    int v = 0;
+    for (int i = 0; i < 10; i++) if (pk[20 + i]) v++;
+    saf_res_valid = v;
+    if (saf_pd_ignore && video_mode_crop)
+    {
+        for (int i = 0; i < 10; i++) pk[20 + i] = 0;
+    }
+}
+
 static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     saf_sel_in[0] = regs[0]; saf_sel_in[1] = regs[1]; saf_sel_in[2] = regs[2];
@@ -642,6 +670,10 @@ static void mcm_af_update()
     {
         saf_hook_err  = patch_hook_function(SAF_SELECT_ADDR, SAF_SELECT_INSN, &saf_select_hook, "crop_rec: SAF mode select spy");
         saf_hook_err |= patch_hook_function(SAF_SETUP_ADDR, SAF_SETUP_INSN, &saf_setup_hook, "crop_rec: SAF setup mode") << 8;
+    }
+    if (saf_result_hook_err == -1)
+    {
+        saf_result_hook_err = patch_hook_function(SAF_RESULT_ADDR, SAF_RESULT_INSN, &saf_result_hook, "crop_rec: SAF result (phase detect)");
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2926,6 +2958,14 @@ static MENU_UPDATE_FUNC(saf_debug_update)
     MENU_SET_RINFO("flags %x cls %d", SAF_DEBUG_FLAGS, SAF_DEBUG_CLASS & 0xFF);
 }
 
+static MENU_UPDATE_FUNC(saf_pd_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (saf_result_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_result_hook_err); return; }
+    MENU_SET_RINFO("D0 %d R0 %x, %d ok", saf_res_d0, saf_res_r0, saf_res_valid);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Phase-detect results so far: %d. Values shown are before Ignore.", saf_res_count);
+}
+
 static MENU_SELECT_FUNC(saf_save_select)
 {
     FILE * f = FIO_CreateFile("ML/SAF.TXT");
@@ -3575,6 +3615,15 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_mode_update,
         .help       = "Phase-detect (Hybrid CMOS AF) mode. Right side: mode Canon chose / mode used.\n"
                       "Override applies in mcm presets only, at the next LiveView start.\n",
+    },
+    {
+        .name       = "Phase detect (mcm)",
+        .priv       = &saf_pd_ignore,
+        .max        = 1,
+        .choices    = CHOICES("Canon", "Ignore"),
+        .update     = saf_pd_update,
+        .help       = "Ignore: mark Hybrid AF phase-detect results unreliable in mcm presets,\n"
+                      "so AF uses contrast only. Takes effect immediately.\n",
     },
     {
         .name       = "Save SAF info",
