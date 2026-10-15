@@ -230,6 +230,7 @@ struct dmlog_entry { uint32_t t; uint16_t cls, lvl; const char * fmt; uint32_t a
 static struct dmlog_entry dmlog[DMLOG_N];
 static volatile int dmlog_w = 0;
 static volatile int gmt_trace = 0;          /* AF frame trace: only Gmt classes, repeats collapsed, no freeze */
+static volatile int saf_trace_cls = -1;     /* when >= 0, Freeze trace keeps only this class, 154 and markers */
 static volatile int frz_trace = 0;          /* freeze trace: all classes, repeats collapsed, stops after a LV freeze */
 static volatile int frz_stop_at = 0;        /* 0 = running; else stop when dmlog_w reaches it */
 static uint32_t dm_cls_count[256];          /* messages per class (before collapsing), for the file header */
@@ -246,6 +247,7 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
          * Identical consecutive messages are collapsed. */
         if (gmt_trace && cls != DM_MARKER && cls != 154 && cls != 196) return;
         if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
+        if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != saf_trace_cls) return;
         if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
         if (w > 0)
@@ -2889,6 +2891,40 @@ static MENU_UPDATE_FUNC(saf_mode_update)
         saf_seen_count, saf_sel_in[0], saf_sel_in[1], saf_sel_in[2], saf_sel_in[3], saf_sel_in[4], saf_sel_in[5]);
 }
 
+/* Canon's own SAF debug switches (RAM 0x958C0, read by SAF.c / SAFState.c):
+ * 0x01 setup details, 0x02 accumulator reset, 0x04 each DefocusResult,
+ * 0x80 every 3rd result: 4 areas ">>> defocus(reliability) ...", 0x100 ghost judge.
+ * Messages go to the class in [0x958C4]; capture them with "Freeze trace" (all classes). */
+#define SAF_DEBUG_FLAGS     (*(volatile uint32_t *) 0x958C0)
+#define SAF_DEBUG_CLASS     (*(volatile uint32_t *) 0x958C4)
+static int saf_debug = 0;
+static uint32_t saf_debug_old = 0;
+
+static MENU_SELECT_FUNC(saf_debug_select)
+{
+    if (!is_EOSM2) return;
+    if (!saf_debug)
+    {
+        saf_debug_old = SAF_DEBUG_FLAGS;
+        SAF_DEBUG_FLAGS = saf_debug_old | 0x187;
+        saf_debug = 1;
+        saf_trace_cls = SAF_DEBUG_CLASS & 0xFF;
+    }
+    else
+    {
+        SAF_DEBUG_FLAGS = saf_debug_old;
+        saf_debug = 0;
+        saf_trace_cls = -1;
+    }
+}
+
+static MENU_UPDATE_FUNC(saf_debug_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    MENU_SET_VALUE(saf_debug ? "ON" : "OFF");
+    MENU_SET_RINFO("flags %x cls %d", SAF_DEBUG_FLAGS, SAF_DEBUG_CLASS & 0xFF);
+}
+
 static MENU_SELECT_FUNC(saf_save_select)
 {
     FILE * f = FIO_CreateFile("ML/SAF.TXT");
@@ -3543,6 +3579,13 @@ static struct menu_entry crop_rec_menu[] =
         .name       = "Save SAF info",
         .select     = saf_save_select,
         .help       = "Writes ML/SAF.TXT: Hybrid AF setup seen without and with Digital zoom.\n",
+    },
+    {
+        .name       = "SAF debug log",
+        .select     = saf_debug_select,
+        .update     = saf_debug_update,
+        .help       = "Turns on Canon's Hybrid AF debug messages (phase-detect results).\n"
+                      "While ON, Freeze trace keeps only these + AF state (class 154).\n",
     },
 };
 
