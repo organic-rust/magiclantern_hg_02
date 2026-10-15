@@ -341,6 +341,51 @@ static int install_debugmsg_capture()
 #define PSTATE_MPU_IN_INSN  0xE92D41F0      /* push {r4-r8, lr} */
 static int pstate_hook_err = -1;
 
+/* ---------------------------------------------------------------------------
+ * Hybrid CMOS AF (on-sensor phase detection, "SAF") mode, EOS M2 1.0.3.
+ * Evf picks a SAF mode for the current sensor readout (RAM 0x11E94, inputs:
+ * r0 shooting kind, r1 Evf LV mode, r2 zoom, r3 + 2 stack args) and passes it to
+ * SAF_SetupCaptureForMovie (FF101C00, param[0] = mode; 1..8 valid, else "through" =
+ * no phase detection). Movie crop / Digital zoom (Evf mode 11/12) gets mode 8, which
+ * expects Canon's Digital zoom readout - crop_rec's mcm readout is different, which
+ * may leave phase detection reading the wrong pixels (slow, hesitant AF).
+ * These hooks show what is chosen and allow overriding it for testing.
+ * --------------------------------------------------------------------------- */
+#define SAF_SELECT_ADDR     0x11E94
+#define SAF_SELECT_INSN     0xE92D4070      /* push {r4, r5, r6, lr} */
+#define SAF_SETUP_ADDR      0xFF101C00
+#define SAF_SETUP_INSN      0xE92D43F0      /* push {r4-r9, lr} */
+static int saf_hook_err = -1;
+static int saf_override = 0;                /* 0 = Canon; 1..8 = force mode; 9 = phase detection off */
+static volatile int saf_seen_mode = -1;     /* last mode Canon chose */
+static volatile int saf_used_mode = -1;     /* last mode actually passed on */
+static volatile int saf_seen_count = 0;
+static volatile uint32_t saf_sel_in[6];     /* last inputs to the mode selector */
+
+static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    saf_sel_in[0] = regs[0]; saf_sel_in[1] = regs[1]; saf_sel_in[2] = regs[2];
+    saf_sel_in[3] = regs[3]; saf_sel_in[4] = stack[0]; saf_sel_in[5] = stack[1];
+}
+
+
+static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * param = (uint32_t *) regs[0];
+    if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
+    int mode = param[0];
+    saf_seen_mode = mode;
+    saf_seen_count++;
+    /* override only in the mcm presets (Digital zoom readout rewired by crop_rec) */
+    if (saf_override && video_mode_crop)
+    {
+        param[0] = saf_override;
+    }
+    saf_used_mode = param[0];
+    dmlog_add(0xFFFF, 0, "*** ML-SPY SAF setup mode %d -> %d (evf in %x %x %x)",
+        mode, param[0], saf_sel_in[0], saf_sel_in[1], saf_sel_in[2]);
+}
+
 /* gmtUpdateNoface (FF18F270): with Digital zoom active, Face+Tracking without a face falls
  * back to "##### DZOOM AF #####" (one small box). Without Digital zoom it uses
  * "##### MULTI AF #####" (wide multi-zone). Make the branch at FF18F65C unconditional
@@ -558,6 +603,13 @@ static void mcm_af_update()
     {
         unpatch_memory(NOFACE_DZOOM_BRANCH_ADDR);
         noface_patched = 0;
+    }
+
+    /* Hybrid AF mode readout/override hooks (cheap: called on LiveView setup only) */
+    if (saf_hook_err == -1)
+    {
+        saf_hook_err  = patch_hook_function(SAF_SELECT_ADDR, SAF_SELECT_INSN, &saf_select_hook, "crop_rec: SAF mode select spy");
+        saf_hook_err |= patch_hook_function(SAF_SETUP_ADDR, SAF_SETUP_INSN, &saf_setup_hook, "crop_rec: SAF setup mode") << 8;
     }
 
     /* the AF filter itself: one hook in PropertyState's MPU input, only when an AF method is chosen */
@@ -2799,6 +2851,15 @@ static void frz_trace_poll()
     }
 }
 
+static MENU_UPDATE_FUNC(saf_mode_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (saf_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_hook_err); return; }
+    MENU_SET_RINFO("Canon %d, used %d", saf_seen_mode, saf_used_mode);
+    MENU_SET_WARNING(MENU_WARN_INFO, "SAF setups %d. Evf in: kind %d, lvmode %d, zoom %x, %d %d %d. Restart LV to apply.",
+        saf_seen_count, saf_sel_in[0], saf_sel_in[1], saf_sel_in[2], saf_sel_in[3], saf_sel_in[4], saf_sel_in[5]);
+}
+
 /* SET on "Freeze trace": start; SET again: stop and save ML/FRZLOG.TXT */
 static MENU_SELECT_FUNC(frz_trace_select)
 {
@@ -3408,6 +3469,15 @@ static struct menu_entry crop_rec_menu[] =
         .select     = frz_trace_select,
         .help       = "SET: start logging all Canon messages. Stops itself ~0.7 s after a\n"
                       "LiveView freeze. SET again: save ML/FRZLOG.TXT.\n",
+    },
+    {
+        .name       = "Hybrid AF mode",
+        .priv       = &saf_override,
+        .max        = 9,
+        .choices    = CHOICES("Canon", "1", "2", "3", "4", "5", "6", "7", "8", "Off (contrast only)"),
+        .update     = saf_mode_update,
+        .help       = "Phase-detect (Hybrid CMOS AF) mode. Right side: mode Canon chose / mode used.\n"
+                      "Override applies in mcm presets only, at the next LiveView start.\n",
     },
 };
 
