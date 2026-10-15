@@ -187,6 +187,17 @@ static int pwlog_r = 0;
 static volatile int pw_count_af = 0, pw_count_vm = 0, pw_count_zoom = 0;
 /* AF writes kept separately so other writes can't push them out: first 2 + last 2 */
 static struct { uint32_t caller; uint32_t val; uint8_t kind; } afw_first[2], afw_last[2];
+/* AF_SYSTEM change notifications seen by our prop handler, with context */
+static volatile int af_notify_count = 0;
+static struct { int old, val, vm, zoom, crop, disp; } af_notify[2];   /* [0] first, [1] latest */
+static volatile int af_last_val = -1;
+
+/* PropertyMgr "deliver array" (partner notify from the MPU layer); raw args when one is AF_SYSTEM */
+#define PROP_DELIVER_ARRAY_ADDR   0xFF12CE70
+#define PROP_DELIVER_ARRAY_INSN   0xE92D4FF8    /* push {r3-r11, lr} */
+static volatile int dlvarr_af_count = 0;
+static uint32_t dlvarr_af_args[6];               /* r0..r3, stack[0], caller (first hit) */
+
 static int prop_spy_active = 0;
 static int prop_spy_err = 0;
 
@@ -220,6 +231,31 @@ static void FAST prop_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     pwlog[w % PWLOG_N].kind   = (pc == PROP_DELIVER_ADDR) ? 'D' : (pc == PROP_REQUEST_CHANGE_ADDR) ? 'R' : 'W';
     pwlog[w % PWLOG_N].which  = which;
     pwlog_w = w + 1;
+}
+
+static void FAST deliver_array_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    /* args layout not known for sure: look for the AF_SYSTEM ID in any of them,
+     * including one level of pointer (r3 often points to the payload) */
+    int hit = 0;
+    for (int i = 0; i < 4; i++)
+        if (regs[i] == PROP_LIVE_VIEW_AF_SYSTEM) hit = 1;
+    if (stack[0] == PROP_LIVE_VIEW_AF_SYSTEM) hit = 1;
+    for (int i = 0; i < 4 && !hit; i++)
+    {
+        uint32_t a = regs[i];
+        if ((a & 3) == 0 && a > 0x1000 && a < 0x10000000 &&   /* stay inside RAM */
+            *(volatile uint32_t *) a == PROP_LIVE_VIEW_AF_SYSTEM) hit = 1;
+    }
+    if (!hit) return;
+
+    if (dlvarr_af_count == 0)
+    {
+        for (int i = 0; i < 4; i++) dlvarr_af_args[i] = regs[i];
+        dlvarr_af_args[4] = stack[0];
+        dlvarr_af_args[5] = PATCH_HOOK_CALLER();
+    }
+    dlvarr_af_count++;
 }
 
 /* runs in the MPU receive path: keep it short, no printf / msleep here */
@@ -289,6 +325,7 @@ static void mcm_af_update()
     {
         prop_spy_err  = patch_hook_function(PROP_REQUEST_CHANGE_ADDR, PROP_REQUEST_CHANGE_INSN, &prop_write_hook, "crop_rec: prop_request_change spy");
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
+        prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2151,6 +2188,20 @@ PROP_HANDLER(PROP_LV_DISPSIZE)
 
 PROP_HANDLER(PROP_LIVE_VIEW_AF_SYSTEM)
 {
+    int v = buf[0];
+    if (v != af_last_val)
+    {
+        int n = af_notify_count;
+        int k = (n == 0) ? 0 : 1;
+        af_notify[k].old  = af_last_val;
+        af_notify[k].val  = v;
+        af_notify[k].vm   = pw_count_vm;
+        af_notify[k].zoom = pw_count_zoom;
+        af_notify[k].crop = video_mode_crop;
+        af_notify[k].disp = lv_dispsize;
+        af_notify_count = n + 1;
+        af_last_val = v;
+    }
     if (mcm_af_log) printf("[PROP] t=%05x AF_SYSTEM  %d (crop=%d, filter=%d, rewrites=%d)\n",
         GET_DIGIC_TIMER(), buf[0], video_mode_crop, mcm_af_filter, mcm_af_rewrites);
 }
@@ -2198,7 +2249,20 @@ static MENU_UPDATE_FUNC(prop_log_menu_update)
     }
     else if (n == 0)
     {
-        MENU_SET_WARNING(MENU_WARN_INFO, "no AF_SYSTEM writes seen");
+        /* no request/deliver: show AF change notifications (old>new after Vn/Zn writes, crop, zoom)
+         * and the deliver-array hits */
+        char c[2][28] = {{0}};
+        int m = af_notify_count;
+        for (int j = 0; j < 2 && j < m; j++)
+        {
+            int k = j;      /* first, latest */
+            snprintf(c[j], sizeof(c[j]), "%d>%d V%dZ%d c%d z%d",
+                af_notify[k].old, af_notify[k].val, af_notify[k].vm, af_notify[k].zoom,
+                af_notify[k].crop, af_notify[k].disp);
+        }
+        MENU_SET_WARNING(MENU_WARN_INFO, "N%d %s | %s | DA%d %x %x %x %x @%x",
+            m, c[0], c[1], dlvarr_af_count,
+            dlvarr_af_args[0], dlvarr_af_args[1], dlvarr_af_args[2], dlvarr_af_args[3], dlvarr_af_args[5]);
     }
     else
     {
