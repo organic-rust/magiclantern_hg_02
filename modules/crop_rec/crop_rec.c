@@ -362,6 +362,17 @@ static volatile int saf_used_mode = -1;     /* last mode actually passed on */
 static volatile int saf_seen_count = 0;
 static volatile uint32_t saf_sel_in[6];     /* last inputs to the mode selector */
 
+/* one snapshot per case (0 = no Digital zoom, 1 = Digital zoom / mcm), saved to ML/SAF.TXT */
+struct saf_snap {
+    int valid, count, mode_in, mode_out;
+    uint32_t sel_in[6];
+    uint16_t param[12];         /* SAF_SetupCaptureForMovie param block (mode u32 + 10 halfwords) */
+    uint32_t rd_start, rd_end;  /* sensor readout start/end (C0F06800 / C0F06804) */
+    uint32_t geo_ptr[2];        /* Evf geometry structs used for the SAF window (0x9269C+0x44/+0x48) */
+    uint16_t geo[2][12];
+};
+static struct saf_snap saf_snap[2];
+
 static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     saf_sel_in[0] = regs[0]; saf_sel_in[1] = regs[1]; saf_sel_in[2] = regs[2];
@@ -382,6 +393,24 @@ static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         param[0] = saf_override;
     }
     saf_used_mode = param[0];
+
+    struct saf_snap * sn = &saf_snap[video_mode_crop ? 1 : 0];
+    sn->valid = 1;
+    sn->count++;
+    sn->mode_in = mode;
+    sn->mode_out = param[0];
+    for (int i = 0; i < 6; i++) sn->sel_in[i] = saf_sel_in[i];
+    uint16_t * ph = (uint16_t *) param;
+    for (int i = 0; i < 12; i++) sn->param[i] = ph[i];
+    sn->rd_start = shamem_read(0xC0F06800);
+    sn->rd_end   = shamem_read(0xC0F06804);
+    for (int k = 0; k < 2; k++)
+    {
+        uint32_t g = *(volatile uint32_t *)(0x9269C + 0x44 + 4 * k);
+        sn->geo_ptr[k] = g;
+        for (int i = 0; i < 12; i++)
+            sn->geo[k][i] = (g && !(g & 1) && g < 0x10000000) ? ((volatile uint16_t *) g)[i] : 0;
+    }
     dmlog_add(0xFFFF, 0, "*** ML-SPY SAF setup mode %d -> %d (evf in %x %x %x)",
         mode, param[0], saf_sel_in[0], saf_sel_in[1], saf_sel_in[2]);
 }
@@ -2860,6 +2889,37 @@ static MENU_UPDATE_FUNC(saf_mode_update)
         saf_seen_count, saf_sel_in[0], saf_sel_in[1], saf_sel_in[2], saf_sel_in[3], saf_sel_in[4], saf_sel_in[5]);
 }
 
+static MENU_SELECT_FUNC(saf_save_select)
+{
+    FILE * f = FIO_CreateFile("ML/SAF.TXT");
+    if (!f) { NotifyBox(2000, "Cannot create ML/SAF.TXT"); return; }
+    char * buf = malloc(2048);
+    int len = 0;
+    for (int c = 0; c < 2; c++)
+    {
+        struct saf_snap * sn = &saf_snap[c];
+        len += snprintf(buf + len, 2048 - len, "== %s: %s\n", c ? "Digital zoom / mcm" : "normal",
+            sn->valid ? "" : "(not seen yet)");
+        if (!sn->valid) continue;
+        len += snprintf(buf + len, 2048 - len, "setups %d, mode %d -> %d\n", sn->count, sn->mode_in, sn->mode_out);
+        len += snprintf(buf + len, 2048 - len, "selector in: kind %d lvmode %d zoom %x r3 %d s0 %d s1 %d\n",
+            sn->sel_in[0], sn->sel_in[1], sn->sel_in[2], sn->sel_in[3], sn->sel_in[4], sn->sel_in[5]);
+        len += snprintf(buf + len, 2048 - len, "param:");
+        for (int i = 0; i < 12; i++) len += snprintf(buf + len, 2048 - len, " %d", sn->param[i]);
+        len += snprintf(buf + len, 2048 - len, "\nreadout start %x end %x\n", sn->rd_start, sn->rd_end);
+        for (int k = 0; k < 2; k++)
+        {
+            len += snprintf(buf + len, 2048 - len, "geo%d @%x:", k, sn->geo_ptr[k]);
+            for (int i = 0; i < 12; i++) len += snprintf(buf + len, 2048 - len, " %d", sn->geo[k][i]);
+            len += snprintf(buf + len, 2048 - len, "\n");
+        }
+    }
+    FIO_WriteFile(f, buf, len);
+    FIO_CloseFile(f);
+    free(buf);
+    NotifyBox(2000, "Saved ML/SAF.TXT");
+}
+
 /* SET on "Freeze trace": start; SET again: stop and save ML/FRZLOG.TXT */
 static MENU_SELECT_FUNC(frz_trace_select)
 {
@@ -3478,6 +3538,11 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_mode_update,
         .help       = "Phase-detect (Hybrid CMOS AF) mode. Right side: mode Canon chose / mode used.\n"
                       "Override applies in mcm presets only, at the next LiveView start.\n",
+    },
+    {
+        .name       = "Save SAF info",
+        .select     = saf_save_select,
+        .help       = "Writes ML/SAF.TXT: Hybrid AF setup seen without and with Digital zoom.\n",
     },
 };
 
