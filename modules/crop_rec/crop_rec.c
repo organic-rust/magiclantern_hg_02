@@ -324,7 +324,11 @@ static void FAST pstate_mpu_in_hook(uint32_t* regs, uint32_t* stack, uint32_t pc
     int orig = data[0];
     int rewrote = 0;
     mpu_af_spells++;
-    if (mcm_af_filter && mcm_af_target > 0 && orig != mcm_af_target)
+    /* Only while not magnified: crop_rec toggles x5 while applying the preset, and Canon's
+     * AF state machine (GmtWakuState) mishandles a switch to Face while zoomed (it ends up
+     * in a single-point state). Leave the MPU's value alone then; mcm_af_poll() re-sends
+     * VIDEO_MODE once zoom is back at x1, so the change 1 -> target is delivered cleanly. */
+    if (mcm_af_filter && mcm_af_target > 0 && orig != mcm_af_target && lv_dispsize == 1)
     {
         data[0] = mcm_af_target;
         rewrote = 1;
@@ -550,7 +554,7 @@ static void mcm_af_poll()
     static int resync_tries = 0;
     static int resync_last = 0;
     if (!lv || !mcm_af_filter) resync_tries = 0;
-    if (mcm_af_filter && pstate_hook_err == 0 && lv && video_mode_crop && !RECORDING &&
+    if (mcm_af_filter && pstate_hook_err == 0 && lv && video_mode_crop && !RECORDING && lv_dispsize == 1 &&
         !gui_menu_shown() && mcm_af_target > 0 && lv_af_mode != mcm_af_target &&
         cur_video_mode_len >= 20 && resync_tries < 2 &&
         should_run_polling_action(2000, &resync_last))
