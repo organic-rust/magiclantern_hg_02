@@ -205,6 +205,12 @@ static uint32_t dlvarr_af_args[6];               /* r0..r3, stack[0], caller (fi
 static volatile int post_af_count = 0;
 static struct { uint32_t type, api, ret[4], w[5]; } post_af[2];    /* [0] first, [1] latest */
 
+/* SetPropertyData: writes a property's stored value directly (no PropertyMgr message) */
+#define SET_PROP_DATA_ADDR  0xFF12F280
+#define SET_PROP_DATA_INSN  0xE92D43F0      /* push {r4-r9, lr} */
+static volatile int setdata_af_count = 0;
+static struct { uint32_t val, api, ret[4]; } setdata_af[2];        /* [0] first, [1] latest */
+
 static int prop_spy_active = 0;
 static int prop_spy_err = 0;
 
@@ -274,6 +280,22 @@ static void FAST propmgr_post_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     for (; r < 4; r++) post_af[k].ret[r] = 0;
 
     post_af_count = n + 1;
+}
+
+static void FAST set_prop_data_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    if (regs[0] != PROP_LIVE_VIEW_AF_SYSTEM) return;
+
+    int n = setdata_af_count;
+    int k = (n == 0) ? 0 : 1;
+    uint32_t * buf = (uint32_t *) regs[1];
+    setdata_af[k].val = (buf && !((uint32_t) buf & 3) && (uint32_t) buf < 0x10000000) ? buf[0] : 0xFFFFFFFF;
+    setdata_af[k].api = PATCH_HOOK_CALLER();    /* direct caller of SetPropertyData */
+    int r = 0;
+    for (int i = 0; i < 48 && r < 4; i++)
+        if (looks_like_return_addr(stack[i])) setdata_af[k].ret[r++] = stack[i] - 4;
+    for (; r < 4; r++) setdata_af[k].ret[r] = 0;
+    setdata_af_count = n + 1;
 }
 
 static void FAST deliver_array_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -370,6 +392,7 @@ static void mcm_af_update()
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ADDR, PROP_DELIVER_INSN, &prop_write_hook, "crop_rec: prop_deliver spy") << 8;
         prop_spy_err |= patch_hook_function(PROP_DELIVER_ARRAY_ADDR, PROP_DELIVER_ARRAY_INSN, &deliver_array_hook, "crop_rec: deliver array spy") << 4;
         prop_spy_err |= patch_hook_function(PROPMGR_POST_ADDR, PROPMGR_POST_INSN, &propmgr_post_hook, "crop_rec: PropertyMgr post spy") << 12;
+        prop_spy_err |= patch_hook_function(SET_PROP_DATA_ADDR, SET_PROP_DATA_INSN, &set_prop_data_hook, "crop_rec: SetPropertyData spy") << 20;
         prop_spy_active = !prop_spy_err;
 
         /* ML core wrapper: records the real caller of set_lv_zoom & co. */
@@ -2332,6 +2355,28 @@ static MENU_UPDATE_FUNC(post_log_menu_update)
         post_af[k].api, post_af[k].ret[0], post_af[k].ret[1], post_af[k].ret[2], post_af[k].ret[3]);
 }
 
+static MENU_UPDATE_FUNC(setdata_menu_update)
+{
+    /* latest direct SetPropertyData(AF_SYSTEM): value, caller and call chain */
+    int n = setdata_af_count;
+    int k = (n > 1) ? 1 : 0;
+    MENU_SET_VALUE("%d", n);
+    if (!prop_spy_active)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "spy %s (err %x)", prop_spy_err ? "ERR" : "off", prop_spy_err);
+        return;
+    }
+    if (n == 0)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "no SetPropertyData(AF_SYSTEM) yet");
+        return;
+    }
+    MENU_SET_RINFO("val %d", (int) setdata_af[k].val);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%x<%x<%x<%x<%x | first: v%d %x<%x",
+        setdata_af[k].api, setdata_af[k].ret[0], setdata_af[k].ret[1], setdata_af[k].ret[2], setdata_af[k].ret[3],
+        (int) setdata_af[0].val, setdata_af[0].api, setdata_af[0].ret[0]);
+}
+
 static MENU_UPDATE_FUNC(crop_update)
 {
     if ((CROP_PRESET_MENU && lv) && !is_EOSM && !is_EOSM2)
@@ -2393,6 +2438,10 @@ static struct menu_entry crop_rec_menu[] =
                 .update = prop_log_menu_update,
                 .help   = "Counts: A=AF_SYSTEM V=VIDEO_MODE Z=DISPSIZE writes. Bottom: AF writes\n"
                           "W=ML wait wrapper, R=Canon request, D=deliver; value@caller.\n",
+            },
+            {
+                .name   = "AF set log",
+                .update = setdata_menu_update,
             },
             {
                 .name   = "AF msg log",
