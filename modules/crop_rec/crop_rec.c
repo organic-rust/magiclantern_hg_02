@@ -397,6 +397,10 @@ static int saf_drop_patched = 0;
 static int saf_drop_err = 0;
 static volatile int saf_res_count = 0;
 static volatile int saf_res_d0 = 0, saf_res_r0 = 0, saf_res_valid = 0;
+#define SAF_HIST_N 32
+static volatile int saf_hist_w = 0;
+static volatile int saf_hist_valid[SAF_HIST_N];
+static volatile int saf_hist_jump[SAF_HIST_N];
 
 static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
@@ -408,6 +412,16 @@ static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     int v = 0;
     for (int i = 0; i < 10; i++) if (pk[20 + i]) v++;
     saf_res_valid = v;
+
+    /* quality metrics over the last 32 results: valid areas, D0 frame-to-frame jump */
+    static int last_d0 = 0;
+    int i = saf_hist_w % SAF_HIST_N;
+    saf_hist_valid[i] = v;
+    int jump = saf_res_d0 - last_d0; if (jump < 0) jump = -jump;
+    saf_hist_jump[i] = (pk[20] && saf_hist_w) ? jump : -1;
+    last_d0 = saf_res_d0;
+    saf_hist_w++;
+
     if (saf_pd_ignore == 1 && video_mode_crop)
     {
         for (int i = 0; i < 10; i++) pk[20 + i] = 0;
@@ -428,8 +442,60 @@ static int saf_picker = 0;                  /* 0 = Canon, 1 = picker 0, 2 = pick
 static int saf_picker_applied = 0;
 static int saf_picker_err = 0;
 
+/* Picker program format (16-bit words, top 6 bits = opcode, low 10 bits = value), one block
+ * of 11 words per window, each window twice (op 0xC value 0/1 = the two pixel halves):
+ *   op F 0x320+n (+0x40 for 2nd half)  window n
+ *   op 0  output offset (steps 32 in picker 1, 64 in picker 0)
+ *   op 2  size?    op 4 / op 3  Y = (op4 << 8) + op3    op 6 / op 5  X = (op6 << 8) + op5
+ *   op A/B  ?      op 8  180 / 60 / 36 for picker 2 / 0 / 1 = 180 / vertical skip (1, 3, 5)
+ *   op C  half     op D  end of window
+ * If op 8 is 180 / vertical line skip, picker 0 is the layout for a 3-line-skip readout like
+ * mcm's. Its Y/X positions are for Canon's own readout of that kind; mcm's window start may
+ * differ, so allow shifting picker 0's Y and X (RAM copy at 0x95A18 is the source that
+ * SetDefaultPickerWindow copies at each LiveView start). */
+#define SAF_PICKER0_TABLE   ((volatile uint16_t *) 0x95A18)
+#define SAF_PICKER0_WORDS   (64 * 4)
+static uint16_t saf_p0_orig[SAF_PICKER0_WORDS];
+static int saf_p0_saved = 0;
+static int saf_p0_yshift = 0, saf_p0_xshift = 0;
+static int saf_p0_applied_y = 0, saf_p0_applied_x = 0;
+
+static void saf_picker0_shift_update()
+{
+    if (!is_EOSM2) return;
+    if (!saf_p0_saved)
+    {
+        for (int i = 0; i < SAF_PICKER0_WORDS; i++) saf_p0_orig[i] = SAF_PICKER0_TABLE[i];
+        saf_p0_saved = 1;
+    }
+    if (saf_p0_yshift == saf_p0_applied_y && saf_p0_xshift == saf_p0_applied_x) return;
+
+    for (int i = 0; i < SAF_PICKER0_WORDS; i++) SAF_PICKER0_TABLE[i] = saf_p0_orig[i];
+    for (int i = 0; i + 1 < SAF_PICKER0_WORDS; i++)
+    {
+        uint16_t w = saf_p0_orig[i], n = saf_p0_orig[i + 1];
+        if ((w >> 10) == 0x4 && (n >> 10) == 0x3)       /* Y high, Y low */
+        {
+            int y = ((w & 0x3FF) << 8) + (n & 0xFF) + saf_p0_yshift;
+            if (y < 0) y = 0;
+            SAF_PICKER0_TABLE[i]     = (0x4 << 10) | ((y >> 8) & 0x3FF);
+            SAF_PICKER0_TABLE[i + 1] = (0x3 << 10) | (n & 0x300) | (y & 0xFF);
+        }
+        if ((w >> 10) == 0x6 && (n >> 10) == 0x5)       /* X high, X low */
+        {
+            int x = ((w & 0x3FF) << 8) + (n & 0xFF) + saf_p0_xshift;
+            if (x < 0) x = 0;
+            SAF_PICKER0_TABLE[i]     = (0x6 << 10) | ((x >> 8) & 0x3FF);
+            SAF_PICKER0_TABLE[i + 1] = (0x5 << 10) | (n & 0x300) | (x & 0xFF);
+        }
+    }
+    saf_p0_applied_y = saf_p0_yshift;
+    saf_p0_applied_x = saf_p0_xshift;
+}
+
 static void saf_picker_update()
 {
+    saf_picker0_shift_update();
     if (saf_picker == saf_picker_applied) return;
     if (saf_picker_applied) { unpatch_memory(SAF_PICKER_M4_ADDR); saf_picker_applied = 0; }
     if (saf_picker)
@@ -3015,11 +3081,27 @@ static MENU_UPDATE_FUNC(saf_picker_menu_update)
     else MENU_SET_RINFO("applied: %s", saf_picker_applied == 1 ? "picker 0" : saf_picker_applied == 2 ? "picker 1" : "Canon");
 }
 
-static MENU_UPDATE_FUNC(saf_pd_update)
+static MENU_UPDATE_FUNC(saf_p0_shift_update_menu)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (saf_picker != 1) MENU_SET_WARNING(MENU_WARN_INFO, "Only used with PD picker = Picker 0. Restart LiveView after changing.");
+    else MENU_SET_WARNING(MENU_WARN_INFO, "Restart LiveView after changing. Then check 'Phase detect (mcm)' quality.");
+}
+
+static MENU_UPDATE_FUNC(saf_pd_update)
+{
+    /* quality over the last 32 results */
+    int n = MIN(saf_hist_w, SAF_HIST_N);
+    int vsum = 0, jsum = 0, jn = 0;
+    for (int i = 0; i < n; i++)
+    {
+        vsum += saf_hist_valid[i];
+        if (saf_hist_jump[i] >= 0) { jsum += saf_hist_jump[i]; jn++; }
+    }
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     if (saf_result_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_result_hook_err); return; }
-    MENU_SET_RINFO("D0 %d R0 %x, %d ok", saf_res_d0, saf_res_r0, saf_res_valid);
+    MENU_SET_RINFO("ok %d.%d jump %d", n ? vsum / n : 0, n ? (vsum * 10 / n) % 10 : 0, jn ? jsum / jn : -1);
+    MENU_SET_VALUE("%s D0 %d", saf_pd_ignore == 2 ? "Drop" : saf_pd_ignore ? "Ignore" : "Canon", saf_res_d0);
     MENU_SET_WARNING(MENU_WARN_INFO, "Phase-detect results so far: %d (shown before Ignore/Drop). drop:%d err:%x",
         saf_res_count, saf_drop_patched, saf_drop_err);
 }
@@ -3682,6 +3764,22 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_picker_menu_update,
         .help       = "Which phase-detect pixel layout SAF mode 4 (Digital zoom/mcm) uses.\n"
                       "Canon = single-window crop layout. Restart LiveView to apply.\n",
+    },
+    {
+        .name       = "Picker 0 Y shift",
+        .priv       = &saf_p0_yshift,
+        .min        = -96,
+        .max        = 96,
+        .update     = saf_p0_shift_update_menu,
+        .help       = "Moves all picker 0 windows vertically (picker 0 units).\n",
+    },
+    {
+        .name       = "Picker 0 X shift",
+        .priv       = &saf_p0_xshift,
+        .min        = -96,
+        .max        = 96,
+        .update     = saf_p0_shift_update_menu,
+        .help       = "Moves all picker 0 windows horizontally (picker 0 units).\n",
     },
     {
         .name       = "Phase detect (mcm)",
