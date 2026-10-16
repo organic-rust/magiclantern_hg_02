@@ -1379,6 +1379,13 @@ static int FAST check_cmos_vidmode(uint16_t* data_buf)
 /* pack two 16-bit values into a 32-bit one */
 #define PACK32(lo,hi) (((uint32_t)(lo) & 0xFFFF) | ((uint32_t)(hi) << 16))
 
+/* Sensor settings that differ between Canon's own 3x3 (H.264 1080p recording) and the M2 mcm preset:
+ *   CMOS[4]: Canon 0x002 in every mode; crop_rec forces 0x034 in all presets ("hot/cold pixels").
+ *            Focus pixels look like cold pixels, so this may also flatten the phase-detect signal.
+ *   CMOS[8]: Canon 3x3 recording 0x400, Digital zoom (mcm base) 0x000. */
+static int cmos4_choice = 0;    /* 0 = 0x34 (crop_rec default), 1 = Canon (0x002) */
+static int cmos8_choice = 0;    /* 0 = Canon, 1 = 0x400 (as in Canon 3x3 recording), 2 = 0x000 */
+
 static void FAST cmos_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     /* make sure we are in 1080p/720p mode */
@@ -1475,7 +1482,9 @@ static void FAST cmos_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 	if (is_EOSM || is_EOSM2)
 	{
 /* hot/cold pixels. Usually 0x2. 0x34 to be tested */ 
-	        cmos_new[4] = 0x34; 
+	        cmos_new[4] = (cmos4_choice == 1) ? 0x002 : 0x34; 
+	        if (is_EOSM2 && cmos8_choice == 1) cmos_new[8] = 0x400;
+	        if (is_EOSM2 && cmos8_choice == 2) cmos_new[8] = 0x000;
 	}
 		
     /* menu overrides */
@@ -4049,6 +4058,22 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_p2_menu_update,
         .help       = "Picker 2 (the one mcm uses with PD picker = Canon): value of command 8,\n"
                       "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
+    },
+    {
+        .name       = "CMOS[4] (focus px?)",
+        .priv       = &cmos4_choice,
+        .max        = 1,
+        .choices    = CHOICES("0x34 (crop_rec)", "0x002 (Canon)"),
+        .help       = "crop_rec forces CMOS[4] = 0x34 ('hot/cold pixels'); Canon uses 0x002.\n"
+                      "May control how strongly focus pixels show. Restart LiveView.\n",
+    },
+    {
+        .name       = "CMOS[8]",
+        .priv       = &cmos8_choice,
+        .max        = 2,
+        .choices    = CHOICES("Canon", "0x400 (Canon 3x3 rec)", "0x000"),
+        .help       = "Canon 3x3 H.264 recording uses 0x400; Digital zoom / mcm gets 0x000.\n"
+                      "Restart LiveView.\n",
     },
     {
         .name       = "PD grid Y offset",
