@@ -2380,7 +2380,26 @@ static inline uint32_t reg_override_1x3_eosm(uint32_t reg, uint32_t old_val)
 
 
 
+/* Raw/readout window start (C0F06800, y << 16 | x) in mcm comes from Canon's Digital zoom setup:
+ * 0x40019 (line 4, column unit 0x19). Canon's own 3x3 (H.264 1080p recording), where phase detect
+ * gives coherent results, uses 0x10013 (line 1, column 0x13). This option moves the window start
+ * (and end, so the size stays the same) to test whether phase detect reads the wrong lines. */
+static int mcm_rd_shift = 0;    /* 0 = Canon, 1 = lines -3, 2 = lines -3 and columns -6, 3 = columns -6 */
+static inline uint32_t reg_override_mcm_mv1080_eosm2_base(uint32_t reg, uint32_t old_val);
 static inline uint32_t reg_override_mcm_mv1080_eosm2(uint32_t reg, uint32_t old_val)
+{
+    uint32_t v = reg_override_mcm_mv1080_eosm2_base(reg, old_val);
+    if (mcm_rd_shift && (reg == 0xC0F06800 || reg == 0xC0F06804))
+    {
+        uint32_t dy = (mcm_rd_shift == 1 || mcm_rd_shift == 2) ? 3 : 0;
+        uint32_t dx = (mcm_rd_shift == 2 || mcm_rd_shift == 3) ? 6 : 0;
+        if (!v) v = old_val;
+        v -= (dy << 16) + dx;
+    }
+    return v;
+}
+
+static inline uint32_t reg_override_mcm_mv1080_eosm2_base(uint32_t reg, uint32_t old_val)
 {
 
 /* gets rid of the black border to the right */
@@ -4058,6 +4077,14 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_p2_menu_update,
         .help       = "Picker 2 (the one mcm uses with PD picker = Canon): value of command 8,\n"
                       "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
+    },
+    {
+        .name       = "Readout start (mcm)",
+        .priv       = &mcm_rd_shift,
+        .max        = 3,
+        .choices    = CHOICES("Canon (line 4)", "line 1", "line 1, col -6", "col -6"),
+        .help       = "Moves the mcm raw window start to match Canon's own 3x3 recording\n"
+                      "(0x10013). Size stays the same. Restart LiveView.\n",
     },
     {
         .name       = "CMOS[4] (focus px?)",
