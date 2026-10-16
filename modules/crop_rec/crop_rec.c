@@ -471,6 +471,10 @@ static struct saf_picker_edit saf_pe[2] = {
     { (volatile uint16_t *) 0x95A18, 64 * 4 },     /* picker 0 */
     { (volatile uint16_t *) 0x95E18,  8 * 4 },     /* picker 2 (Digital zoom / magnify, used by mcm) */
 };
+/* SetDefaultPickerWindow copies from the pointer table at 0x95E68 (picker 0..2); the ROM image
+ * says 0x95A18 / 0x95C18 / 0x95E18, but follow the live pointers in case they differ. */
+#define SAF_PICKER_PTRS     ((volatile uint32_t *) 0x95E68)
+static uint32_t saf_picker_src[3];
 static int saf_p0_yshift = 0, saf_p0_xshift = 0;
 static int saf_p2_yshift = 0, saf_p2_xshift = 0, saf_p2_op8 = 0;
 static const int saf_op8_values[] = { 0, 60, 90, 120, 36, 240, 360, 540 };
@@ -514,6 +518,13 @@ static void saf_picker_edit_apply(struct saf_picker_edit * pe, int yshift, int x
 static void saf_picker0_shift_update()
 {
     if (!is_EOSM2) return;
+    for (int k = 0; k < 3; k++) saf_picker_src[k] = SAF_PICKER_PTRS[k];
+    for (int k = 0; k < 2; k++)
+    {
+        uint32_t src = saf_picker_src[k ? 2 : 0];
+        if (!saf_pe[k].saved && src && !(src & 1) && src < 0x60000000)
+            saf_pe[k].table = (volatile uint16_t *) src;
+    }
     saf_picker_edit_apply(&saf_pe[0], saf_p0_yshift, saf_p0_xshift, 0);
     /* picker 2 is also Canon's normal Digital zoom / magnify layout: edit it only in mcm presets */
     int mcm = is_mcm_preset(crop_preset);
@@ -3137,10 +3148,15 @@ static MENU_UPDATE_FUNC(saf_p2_menu_update)
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     int ly = saf_live_picker_y();
     MENU_SET_RINFO("live Y %d @%x", ly, saf_live_picker_ptr);
-    if (saf_picker != 0) MENU_SET_WARNING(MENU_WARN_INFO, "Only used with PD picker = Canon (mode 4 uses picker 2).");
-    else MENU_SET_WARNING(MENU_WARN_INFO, "mcm only. Restart LiveView after changing. Applied: op8 %d, Y %+d, X %+d.",
-        saf_pe[1].a8 ? saf_pe[1].a8 : 180, saf_pe[1].ay, saf_pe[1].ax);
+    int sy = -1;
+    volatile uint16_t * t = saf_pe[1].table;
+    for (int i = 0; i < 16; i++)
+        if ((t[i] >> 10) == 0x4 && (t[i + 1] >> 10) == 0x3) { sy = ((t[i] & 0x3FF) << 8) + (t[i + 1] & 0xFF); break; }
+    MENU_SET_WARNING(MENU_WARN_INFO, "src ptrs %x %x %x, edited %x (Y %d), applied Y %+d op8 %d",
+        saf_picker_src[0], saf_picker_src[1], saf_picker_src[2], (uint32_t) saf_pe[1].table, sy,
+        saf_pe[1].ay, saf_pe[1].a8 ? saf_pe[1].a8 : 180);
 }
+
 
 static MENU_UPDATE_FUNC(saf_pd_update)
 {
