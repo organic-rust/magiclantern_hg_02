@@ -453,44 +453,67 @@ static int saf_picker_err = 0;
  * mcm's. Its Y/X positions are for Canon's own readout of that kind; mcm's window start may
  * differ, so allow shifting picker 0's Y and X (RAM copy at 0x95A18 is the source that
  * SetDefaultPickerWindow copies at each LiveView start). */
-#define SAF_PICKER0_TABLE   ((volatile uint16_t *) 0x95A18)
-#define SAF_PICKER0_WORDS   (64 * 4)
-static uint16_t saf_p0_orig[SAF_PICKER0_WORDS];
-static int saf_p0_saved = 0;
+/* Editable copies of the picker programs (RAM source tables copied at each LiveView start). */
+struct saf_picker_edit {
+    volatile uint16_t * table;
+    int words;
+    uint16_t orig[64 * 4];
+    int saved;
+    int yshift, xshift, op8;            /* wanted: shifts, op8 value (0 = Canon) */
+    int ay, ax, a8;                     /* applied */
+};
+static struct saf_picker_edit saf_pe[2] = {
+    { (volatile uint16_t *) 0x95A18, 64 * 4 },     /* picker 0 */
+    { (volatile uint16_t *) 0x95E18,  8 * 4 },     /* picker 2 (Digital zoom / magnify, used by mcm) */
+};
 static int saf_p0_yshift = 0, saf_p0_xshift = 0;
-static int saf_p0_applied_y = 0, saf_p0_applied_x = 0;
+static int saf_p2_yshift = 0, saf_p2_xshift = 0, saf_p2_op8 = 0;
+static const int saf_op8_values[] = { 0, 60, 90, 120, 36 };
+
+static void saf_picker_edit_apply(struct saf_picker_edit * pe, int yshift, int xshift, int op8)
+{
+    if (!pe->saved)
+    {
+        for (int i = 0; i < pe->words; i++) pe->orig[i] = pe->table[i];
+        pe->saved = 1;
+    }
+    if (yshift == pe->ay && xshift == pe->ax && op8 == pe->a8) return;
+
+    for (int i = 0; i < pe->words; i++) pe->table[i] = pe->orig[i];
+    for (int i = 0; i < pe->words; i++)
+    {
+        uint16_t w = pe->orig[i];
+        uint16_t n = (i + 1 < pe->words) ? pe->orig[i + 1] : 0;
+        if ((w >> 10) == 0x8 && op8)
+        {
+            pe->table[i] = (0x8 << 10) | (op8 & 0x3FF);
+        }
+        if ((w >> 10) == 0x4 && (n >> 10) == 0x3)       /* Y high, Y low */
+        {
+            int y = ((w & 0x3FF) << 8) + (n & 0xFF) + yshift;
+            if (y < 0) y = 0;
+            pe->table[i]     = (0x4 << 10) | ((y >> 8) & 0x3FF);
+            pe->table[i + 1] = (0x3 << 10) | (n & 0x300) | (y & 0xFF);
+        }
+        if ((w >> 10) == 0x6 && (n >> 10) == 0x5)       /* X high, X low */
+        {
+            int x = ((w & 0x3FF) << 8) + (n & 0xFF) + xshift;
+            if (x < 0) x = 0;
+            pe->table[i]     = (0x6 << 10) | ((x >> 8) & 0x3FF);
+            pe->table[i + 1] = (0x5 << 10) | (n & 0x300) | (x & 0xFF);
+        }
+    }
+    pe->ay = yshift; pe->ax = xshift; pe->a8 = op8;
+}
 
 static void saf_picker0_shift_update()
 {
     if (!is_EOSM2) return;
-    if (!saf_p0_saved)
-    {
-        for (int i = 0; i < SAF_PICKER0_WORDS; i++) saf_p0_orig[i] = SAF_PICKER0_TABLE[i];
-        saf_p0_saved = 1;
-    }
-    if (saf_p0_yshift == saf_p0_applied_y && saf_p0_xshift == saf_p0_applied_x) return;
-
-    for (int i = 0; i < SAF_PICKER0_WORDS; i++) SAF_PICKER0_TABLE[i] = saf_p0_orig[i];
-    for (int i = 0; i + 1 < SAF_PICKER0_WORDS; i++)
-    {
-        uint16_t w = saf_p0_orig[i], n = saf_p0_orig[i + 1];
-        if ((w >> 10) == 0x4 && (n >> 10) == 0x3)       /* Y high, Y low */
-        {
-            int y = ((w & 0x3FF) << 8) + (n & 0xFF) + saf_p0_yshift;
-            if (y < 0) y = 0;
-            SAF_PICKER0_TABLE[i]     = (0x4 << 10) | ((y >> 8) & 0x3FF);
-            SAF_PICKER0_TABLE[i + 1] = (0x3 << 10) | (n & 0x300) | (y & 0xFF);
-        }
-        if ((w >> 10) == 0x6 && (n >> 10) == 0x5)       /* X high, X low */
-        {
-            int x = ((w & 0x3FF) << 8) + (n & 0xFF) + saf_p0_xshift;
-            if (x < 0) x = 0;
-            SAF_PICKER0_TABLE[i]     = (0x6 << 10) | ((x >> 8) & 0x3FF);
-            SAF_PICKER0_TABLE[i + 1] = (0x5 << 10) | (n & 0x300) | (x & 0xFF);
-        }
-    }
-    saf_p0_applied_y = saf_p0_yshift;
-    saf_p0_applied_x = saf_p0_xshift;
+    saf_picker_edit_apply(&saf_pe[0], saf_p0_yshift, saf_p0_xshift, 0);
+    /* picker 2 is also Canon's normal Digital zoom / magnify layout: edit it only in mcm presets */
+    int mcm = is_mcm_preset(crop_preset);
+    saf_picker_edit_apply(&saf_pe[1], mcm ? saf_p2_yshift : 0, mcm ? saf_p2_xshift : 0,
+        mcm ? saf_op8_values[saf_p2_op8] : 0);
 }
 
 static void saf_picker_update()
@@ -3088,6 +3111,14 @@ static MENU_UPDATE_FUNC(saf_p0_shift_update_menu)
     else MENU_SET_WARNING(MENU_WARN_INFO, "Restart LiveView after changing. Then check 'Phase detect (mcm)' quality.");
 }
 
+static MENU_UPDATE_FUNC(saf_p2_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (saf_picker != 0) MENU_SET_WARNING(MENU_WARN_INFO, "Only used with PD picker = Canon (mode 4 uses picker 2).");
+    else MENU_SET_WARNING(MENU_WARN_INFO, "mcm only. Restart LiveView after changing. Applied: op8 %d, Y %+d, X %+d.",
+        saf_pe[1].a8 ? saf_pe[1].a8 : 180, saf_pe[1].ay, saf_pe[1].ax);
+}
+
 static MENU_UPDATE_FUNC(saf_pd_update)
 {
     /* quality over the last 32 results */
@@ -3764,6 +3795,31 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_picker_menu_update,
         .help       = "Which phase-detect pixel layout SAF mode 4 (Digital zoom/mcm) uses.\n"
                       "Canon = single-window crop layout. Restart LiveView to apply.\n",
+    },
+    {
+        .name       = "Picker 2 op8",
+        .priv       = &saf_p2_op8,
+        .max        = 4,
+        .choices    = CHOICES("Canon (180)", "60", "90", "120", "36"),
+        .update     = saf_p2_menu_update,
+        .help       = "Picker 2 (the one mcm uses with PD picker = Canon): value of command 8,\n"
+                      "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
+    },
+    {
+        .name       = "Picker 2 Y shift",
+        .priv       = &saf_p2_yshift,
+        .min        = -224,
+        .max        = 400,
+        .update     = saf_p2_menu_update,
+        .help       = "Moves the picker 2 window vertically (Canon: Y 224).\n",
+    },
+    {
+        .name       = "Picker 2 X shift",
+        .priv       = &saf_p2_xshift,
+        .min        = -478,
+        .max        = 400,
+        .update     = saf_p2_menu_update,
+        .help       = "Moves the picker 2 window horizontally (Canon: X 478).\n",
     },
     {
         .name       = "Picker 0 Y shift",
