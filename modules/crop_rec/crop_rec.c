@@ -365,16 +365,25 @@ static volatile int saf_used_mode = -1;     /* last mode actually passed on */
 static volatile int saf_seen_count = 0;
 static volatile uint32_t saf_sel_in[6];     /* last inputs to the mode selector */
 
-/* one snapshot per case (0 = no Digital zoom, 1 = Digital zoom / mcm), saved to ML/SAF.TXT */
+/* one snapshot per case (0 = normal, 1 = Digital zoom / mcm, 2 = no crop and Canon chose mode 1..3,
+ * e.g. H.264 1080p recording), saved to ML/SAF.TXT */
+#define SAF_NSNAP 3
 struct saf_snap {
     int valid, count, mode_in, mode_out;
+    int late_ok;                /* values read ~0.5 s after setup, when the readout and picker are live */
+    uint32_t rd_start2, rd_end2;
+    int pick_y, pick_b;
+    uint32_t pick_ptr;
+    uint16_t pick_words[24];
+    int16_t grid[8];            /* picker grid table row (0x95F30) for the mode used */
     uint32_t sel_in[6];
     uint16_t param[12];         /* SAF_SetupCaptureForMovie param block (mode u32 + 10 halfwords) */
     uint32_t rd_start, rd_end;  /* sensor readout start/end (C0F06800 / C0F06804) */
     uint32_t geo_ptr[2];        /* Evf geometry structs used for the SAF window (0x9269C+0x44/+0x48) */
     uint16_t geo[2][12];
 };
-static struct saf_snap saf_snap[2];
+static struct saf_snap saf_snap[SAF_NSNAP];
+static volatile int saf_snap_pending = 0;   /* slot + 1 waiting for the late values */
 
 /* SAF_DefocusResult (FF27D608): sends the phase-detect result as a 34-byte property:
  * 10 areas x big-endian s16 defocus (bytes 0..19), 10 x u8 reliability (20..29),
@@ -651,8 +660,11 @@ static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     saf_modify_param(param, 1);
     saf_used_mode = param[0];
 
-    struct saf_snap * sn = &saf_snap[video_mode_crop ? 1 : 0];
+    int slot = video_mode_crop ? 1 : (mode >= 1 && mode <= 3) ? 2 : 0;
+    struct saf_snap * sn = &saf_snap[slot];
     sn->valid = 1;
+    sn->late_ok = 0;
+    saf_snap_pending = slot + 1;
     sn->count++;
     sn->mode_in = mode;
     sn->mode_out = param[0];
@@ -3087,6 +3099,36 @@ static void gmt_trace_poll()
 #define M2_EDMAC_HD_ADDR    0xC0F04108                                  /* HD (YUV) DMA write address */
 
 static int frz_caught = 0;
+static void saf_save_file(void);
+static int saf_live_picker_y(void);
+static uint32_t saf_live_picker_ptr;
+static int saf_live_picker_b;
+
+/* fill the late part of the last SAF snapshot ~0.5 s after setup (called from the polling CBR) */
+static void saf_snap_poll(void)
+{
+    static int pend = 0, t0 = 0;
+    int p = saf_snap_pending;
+    if (!p) { pend = 0; return; }
+    int now = get_ms_clock();
+    if (p != pend) { pend = p; t0 = now; return; }
+    if (now - t0 < 500) return;
+    struct saf_snap * sn = &saf_snap[p - 1];
+    sn->rd_start2 = shamem_read(0xC0F06800);
+    sn->rd_end2   = shamem_read(0xC0F06804);
+    sn->pick_y = saf_live_picker_y();
+    sn->pick_b = saf_live_picker_b;
+    sn->pick_ptr = saf_live_picker_ptr;
+    volatile uint16_t * b = (volatile uint16_t *) saf_live_picker_ptr;
+    for (int i = 0; i < 24; i++)
+        sn->pick_words[i] = (b && !((uint32_t) b & 1) && (uint32_t) b < 0x60000000) ? b[i] : 0;
+    int m = sn->mode_out;
+    for (int i = 0; i < 8; i++)
+        sn->grid[i] = (m >= 0 && m <= 8) ? ((volatile int16_t *)(0x95F30 + 16 * m))[i] : 0;
+    sn->late_ok = 1;
+    saf_snap_pending = 0;
+    pend = 0;
+}
 
 static void frz_trace_poll()
 {
@@ -3095,7 +3137,18 @@ static void frz_trace_poll()
     /* after a freeze, save the log by itself once capture has stopped (or 2 s later), so it
      * survives a battery pull when the camera can't be operated any more */
     static int autosaved = 0, t_caught = 0;
-    if (frz_trace == 1) autosaved = 0;
+    static int rec_saved = 0, rec_done = 0, t_rec_change = 0;
+    if (frz_trace == 1) { autosaved = 0; rec_saved = 0; rec_done = 0; t_rec_change = 0; }
+
+    /* after a recording stops: save the trace and SAF info by themselves (ML menu can't be
+     * used while recording H.264) */
+    if (rec_done && !rec_saved && get_ms_clock() - rec_done > 1500)
+    {
+        rec_saved = 1;
+        dmlog_save_as("ML/FRZREC.TXT");
+        saf_save_file();
+        NotifyBox(3000, "Saved ML/FRZREC.TXT and ML/SAF.TXT");
+    }
     if (frz_caught && !autosaved)
     {
         if (!t_caught) t_caught = get_ms_clock();
@@ -3136,6 +3189,13 @@ static void frz_trace_poll()
     int rec = RECORDING ? 1 : 0;
     if (rec != last_rec)
     {
+        if (last_rec != -1)
+        {
+            t_rec_change = now;
+            /* keep the start of the recording: allow ~3000 more entries, then stop capturing */
+            if (rec && !frz_stop_at) frz_stop_at = dmlog_w + 3000;
+            if (!rec && !rec_saved) rec_done = now ? now : 1;
+        }
         last_rec = rec;
         dmlog_add(DM_MARKER, 0, "*** ML-SPY RECORDING %d (crop %d, AF %d, servo %d)", rec, video_mode_crop, lv_af_mode, movie_servo_af, 0);
     }
@@ -3162,7 +3222,9 @@ static void frz_trace_poll()
     }
 
     /* freeze: the displayed buffer stops changing while LiveView is on screen */
-    int watching = lv && !gui_menu_shown() && disp_changes >= 3;
+    /* not right after recording starts/stops (LiveView pauses while it reconfigures) */
+    if (!lv) disp_changes = 0;
+    int watching = lv && !gui_menu_shown() && disp_changes >= 3 && now - t_rec_change > 3000;
     if (!watching) t_disp = now;
     if (watching && !frz_stop_at && now - t_disp > 700)
     {
@@ -3304,34 +3366,50 @@ static MENU_UPDATE_FUNC(saf_pd_update)
         saf_res_count, saf_res_fpc, saf_drop_patched, saf_drop_err);
 }
 
-static MENU_SELECT_FUNC(saf_save_select)
+static void saf_save_file(void)
 {
     FILE * f = FIO_CreateFile("ML/SAF.TXT");
     if (!f) { NotifyBox(2000, "Cannot create ML/SAF.TXT"); return; }
-    char * buf = malloc(2048);
+    char * buf = malloc(4096);
+    if (!buf) { FIO_CloseFile(f); return; }
     int len = 0;
-    for (int c = 0; c < 2; c++)
+    static const char * names[SAF_NSNAP] = { "normal", "Digital zoom / mcm", "no crop, Canon mode 1..3 (H.264 1080p rec?)" };
+    for (int c = 0; c < SAF_NSNAP; c++)
     {
         struct saf_snap * sn = &saf_snap[c];
-        len += snprintf(buf + len, 2048 - len, "== %s: %s\n", c ? "Digital zoom / mcm" : "normal",
+        len += snprintf(buf + len, 4096 - len, "== %s: %s\n", names[c],
             sn->valid ? "" : "(not seen yet)");
         if (!sn->valid) continue;
-        len += snprintf(buf + len, 2048 - len, "setups %d, mode %d -> %d\n", sn->count, sn->mode_in, sn->mode_out);
-        len += snprintf(buf + len, 2048 - len, "selector in: kind %d lvmode %d zoom %x r3 %d s0 %d s1 %d\n",
+        len += snprintf(buf + len, 4096 - len, "setups %d, mode %d -> %d\n", sn->count, sn->mode_in, sn->mode_out);
+        len += snprintf(buf + len, 4096 - len, "selector in: kind %d lvmode %d zoom %x r3 %d s0 %d s1 %d\n",
             sn->sel_in[0], sn->sel_in[1], sn->sel_in[2], sn->sel_in[3], sn->sel_in[4], sn->sel_in[5]);
-        len += snprintf(buf + len, 2048 - len, "param:");
-        for (int i = 0; i < 12; i++) len += snprintf(buf + len, 2048 - len, " %d", sn->param[i]);
-        len += snprintf(buf + len, 2048 - len, "\nreadout start %x end %x\n", sn->rd_start, sn->rd_end);
+        len += snprintf(buf + len, 4096 - len, "param:");
+        for (int i = 0; i < 12; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->param[i]);
+        len += snprintf(buf + len, 4096 - len, "\nreadout start %x end %x\n", sn->rd_start, sn->rd_end);
         for (int k = 0; k < 2; k++)
         {
-            len += snprintf(buf + len, 2048 - len, "geo%d @%x:", k, sn->geo_ptr[k]);
-            for (int i = 0; i < 12; i++) len += snprintf(buf + len, 2048 - len, " %d", sn->geo[k][i]);
-            len += snprintf(buf + len, 2048 - len, "\n");
+            len += snprintf(buf + len, 4096 - len, "geo%d @%x:", k, sn->geo_ptr[k]);
+            for (int i = 0; i < 12; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->geo[k][i]);
+            len += snprintf(buf + len, 4096 - len, "\n");
+        }
+        if (sn->late_ok)
+        {
+            len += snprintf(buf + len, 4096 - len, "0.5 s later: readout start %x end %x, picker y %d b %d @%x\npicker words:",
+                sn->rd_start2, sn->rd_end2, sn->pick_y, sn->pick_b, sn->pick_ptr);
+            for (int i = 0; i < 24; i++) len += snprintf(buf + len, 4096 - len, " %04x", sn->pick_words[i]);
+            len += snprintf(buf + len, 4096 - len, "\ngrid row (mode %d):", sn->mode_out);
+            for (int i = 0; i < 8; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->grid[i]);
+            len += snprintf(buf + len, 4096 - len, "\n");
         }
     }
     FIO_WriteFile(f, buf, len);
     FIO_CloseFile(f);
     free(buf);
+}
+
+static MENU_SELECT_FUNC(saf_save_select)
+{
+    saf_save_file();
     NotifyBox(2000, "Saved ML/SAF.TXT");
 }
 
@@ -4163,6 +4241,7 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     mcm_af_poll();
     gmt_trace_poll();
     frz_trace_poll();
+    saf_snap_poll();
 
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
