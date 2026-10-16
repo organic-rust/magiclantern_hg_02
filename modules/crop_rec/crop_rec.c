@@ -404,6 +404,33 @@ static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     }
 }
 
+/* SAF "picker": a small program (RAM tables 0x95A18 / 0x95C18 / 0x95E18, copied by
+ * SetDefaultPickerWindow, FF27D168) that tells the phase-detect hardware which readout
+ * lines/columns to pick. The picker is chosen from the SAF mode by FF27D004:
+ * modes 1,3 -> picker 0 (10 window pairs), 2,5 -> picker 1 (10 pairs, normal movie),
+ * 4,6,7 -> picker 2 (1 pair: Digital zoom / magnify). In mcm, mode 4 picks picker 2,
+ * laid out for Canon's 1:1 crop readout. Optionally use picker 0 or 1 with mode 4
+ * (jump table entry for mode 4 at FF27D020). Applied at the next LiveView start. */
+#define SAF_PICKER_M4_ADDR  0xFF27D020
+#define SAF_PICKER_M4_ORIG  0xEA000006      /* b FF27D040 -> picker 2 */
+static const uint32_t saf_picker_m4_new[3] = { 0, 0xEA000002 /* -> picker 0 */, 0xEA000004 /* -> picker 1 */ };
+static int saf_picker = 0;                  /* 0 = Canon, 1 = picker 0, 2 = picker 1 */
+static int saf_picker_applied = 0;
+static int saf_picker_err = 0;
+
+static void saf_picker_update()
+{
+    if (saf_picker == saf_picker_applied) return;
+    if (saf_picker_applied) { unpatch_memory(SAF_PICKER_M4_ADDR); saf_picker_applied = 0; }
+    if (saf_picker)
+    {
+        saf_picker_err = patch_instruction(SAF_PICKER_M4_ADDR, SAF_PICKER_M4_ORIG, saf_picker_m4_new[saf_picker],
+            "crop_rec: SAF mode 4 picker override");
+        if (!saf_picker_err) saf_picker_applied = saf_picker;
+        else saf_picker = 0;
+    }
+}
+
 static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     saf_sel_in[0] = regs[0]; saf_sel_in[1] = regs[1]; saf_sel_in[2] = regs[2];
@@ -671,6 +698,7 @@ static void mcm_af_update()
         saf_hook_err  = patch_hook_function(SAF_SELECT_ADDR, SAF_SELECT_INSN, &saf_select_hook, "crop_rec: SAF mode select spy");
         saf_hook_err |= patch_hook_function(SAF_SETUP_ADDR, SAF_SETUP_INSN, &saf_setup_hook, "crop_rec: SAF setup mode") << 8;
     }
+    saf_picker_update();
     if (saf_result_hook_err == -1)
     {
         saf_result_hook_err = patch_hook_function(SAF_RESULT_ADDR, SAF_RESULT_INSN, &saf_result_hook, "crop_rec: SAF result (phase detect)");
@@ -2958,6 +2986,13 @@ static MENU_UPDATE_FUNC(saf_debug_update)
     MENU_SET_RINFO("flags %x cls %d", SAF_DEBUG_FLAGS, SAF_DEBUG_CLASS & 0xFF);
 }
 
+static MENU_UPDATE_FUNC(saf_picker_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (saf_picker_err) MENU_SET_RINFO("ERR %x", saf_picker_err);
+    else MENU_SET_RINFO("applied: %s", saf_picker_applied == 1 ? "picker 0" : saf_picker_applied == 2 ? "picker 1" : "Canon");
+}
+
 static MENU_UPDATE_FUNC(saf_pd_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
@@ -3615,6 +3650,15 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_mode_update,
         .help       = "Phase-detect (Hybrid CMOS AF) mode. Right side: mode Canon chose / mode used.\n"
                       "Override applies in mcm presets only, at the next LiveView start.\n",
+    },
+    {
+        .name       = "PD picker (mcm)",
+        .priv       = &saf_picker,
+        .max        = 2,
+        .choices    = CHOICES("Canon", "Picker 0", "Picker 1"),
+        .update     = saf_picker_menu_update,
+        .help       = "Which phase-detect pixel layout SAF mode 4 (Digital zoom/mcm) uses.\n"
+                      "Canon = single-window crop layout. Restart LiveView to apply.\n",
     },
     {
         .name       = "Phase detect (mcm)",
