@@ -528,8 +528,7 @@ static void saf_picker0_shift_update()
     saf_picker_edit_apply(&saf_pe[0], saf_p0_yshift, saf_p0_xshift, 0);
     /* picker 2 is also Canon's normal Digital zoom / magnify layout: edit it only in mcm presets */
     int mcm = is_mcm_preset(crop_preset);
-    saf_picker_edit_apply(&saf_pe[1], mcm ? saf_p2_yshift : 0, mcm ? saf_p2_xshift : 0,
-        mcm ? saf_op8_values[saf_p2_op8] : 0);
+    saf_picker_edit_apply(&saf_pe[1], 0, 0, mcm ? saf_op8_values[saf_p2_op8] : 0);
 }
 
 static void saf_picker_update()
@@ -564,6 +563,17 @@ static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (saf_override && video_mode_crop)
     {
         param[0] = saf_override;
+    }
+    /* The live picker window positions are not the default table's: SetPickerWindow (FF27D200,
+     * called from FF27EF14 during this setup) rewrites Y/X from the WIN rectangle passed here
+     * (param halfwords 7..10 = x, y, w, h). Shift that rectangle instead. */
+    if (is_mcm_preset(crop_preset) && (saf_p2_yshift || saf_p2_xshift))
+    {
+        uint16_t * pw = (uint16_t *) param;
+        int x = pw[7] + saf_p2_xshift, y = pw[8] + saf_p2_yshift;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        pw[7] = x; pw[8] = y;
     }
     saf_used_mode = param[0];
 
@@ -3845,20 +3855,22 @@ static struct menu_entry crop_rec_menu[] =
                       "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
     },
     {
-        .name       = "Picker 2 Y shift",
+        .name       = "PD window Y shift",
         .priv       = &saf_p2_yshift,
-        .min        = -224,
+        .min        = -400,
         .max        = 400,
         .update     = saf_p2_menu_update,
-        .help       = "Moves the picker 2 window vertically (Canon: Y 224).\n",
+        .help       = "mcm: shifts the phase-detect window rectangle given to the SAF setup\n"
+                      "(Canon mcm: x 910 y 476 w 172 h 230). Restart LiveView.\n",
     },
     {
-        .name       = "Picker 2 X shift",
+        .name       = "PD window X shift",
         .priv       = &saf_p2_xshift,
-        .min        = -478,
+        .min        = -400,
         .max        = 400,
         .update     = saf_p2_menu_update,
-        .help       = "Moves the picker 2 window horizontally (Canon: X 478).\n",
+        .help       = "mcm: shifts the phase-detect window rectangle horizontally.\n"
+                      "Restart LiveView.\n",
     },
     {
         .name       = "Picker 0 Y shift",
