@@ -559,16 +559,28 @@ static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
  * forced mode), and copies its block over the setup one (so a setup-only WIN shift is lost).
  *   - mode override (mcm only)
  *   - WIN rectangle shift (param halfwords 7..10 = x, y, w, h; mcm presets only) */
-static void saf_modify_param(uint32_t * param)
+/* The menu values are latched at setup (LiveView start) and only those latched values are
+ * used by SAF_Start, so changing the menu while LiveView runs can't make the two disagree
+ * (that trips the SAF.c:298 assert straight away). */
+static int saf_latched_mode = 0, saf_latched_dx = 0, saf_latched_dy = 0;
+
+static void saf_modify_param(uint32_t * param, int is_setup)
 {
-    if (saf_override && video_mode_crop)
+    if (is_setup)
     {
-        param[0] = saf_override;
+        saf_latched_mode = (saf_override && video_mode_crop) ? saf_override : 0;
+        int mcm = is_mcm_preset(crop_preset);
+        saf_latched_dx = mcm ? saf_p2_xshift : 0;
+        saf_latched_dy = mcm ? saf_p2_yshift : 0;
     }
-    if (is_mcm_preset(crop_preset) && (saf_p2_yshift || saf_p2_xshift))
+    if (saf_latched_mode)
+    {
+        param[0] = saf_latched_mode;
+    }
+    if (saf_latched_dx || saf_latched_dy)
     {
         uint16_t * pw = (uint16_t *) param;
-        int x = pw[7] + saf_p2_xshift, y = pw[8] + saf_p2_yshift;
+        int x = pw[7] + saf_latched_dx, y = pw[8] + saf_latched_dy;
         if (x < 0) x = 0;
         if (y < 0) y = 0;
         pw[7] = x; pw[8] = y;
@@ -585,7 +597,7 @@ static void FAST saf_start_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     uint32_t * param = (uint32_t *) regs[0];
     if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
     saf_start_count++;
-    saf_modify_param(param);
+    saf_modify_param(param, 0);
 }
 
 static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -596,7 +608,7 @@ static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     saf_seen_mode = mode;
     saf_seen_count++;
     /* override only in the mcm presets (Digital zoom readout rewired by crop_rec) */
-    saf_modify_param(param);
+    saf_modify_param(param, 1);
     saf_used_mode = param[0];
 
     struct saf_snap * sn = &saf_snap[video_mode_crop ? 1 : 0];
@@ -3884,7 +3896,7 @@ static struct menu_entry crop_rec_menu[] =
         .choices    = CHOICES("Canon", "1", "2", "3", "4", "5", "6", "7", "8", "Off (contrast only)"),
         .update     = saf_mode_update,
         .help       = "Phase-detect (Hybrid CMOS AF) mode. Right side: mode Canon chose / mode used.\n"
-                      "Override applies in mcm presets only, at the next LiveView start.\n",
+                      "mcm only. Takes effect at the next LiveView start (Canon menu and back).\n",
     },
     {
         .name       = "PD picker (mcm)",
