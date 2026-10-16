@@ -3116,9 +3116,23 @@ static MENU_UPDATE_FUNC(saf_p0_shift_update_menu)
     else MENU_SET_WARNING(MENU_WARN_INFO, "Restart LiveView after changing. Then check 'Phase detect (mcm)' quality.");
 }
 
+/* Y of the first window in the picker copy SAF is actually using: two copy buffers
+ * (pointers at 0xD2520 and 0xD2520+0x54), current one selected by [0x95E58] (u16). */
+static int saf_live_picker_y()
+{
+    int cur = *(volatile uint16_t *) 0x95E58;
+    volatile uint16_t * buf = *(volatile uint16_t * volatile *)(0xD2520 + (cur ? 0x54 : 0));
+    if (!buf || ((uint32_t) buf & 1) || (uint32_t) buf > 0x10000000) return -1;
+    for (int i = 0; i < 16; i++)
+        if ((buf[i] >> 10) == 0x4 && (buf[i + 1] >> 10) == 0x3)
+            return ((buf[i] & 0x3FF) << 8) + (buf[i + 1] & 0xFF);
+    return -2;
+}
+
 static MENU_UPDATE_FUNC(saf_p2_menu_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    MENU_SET_RINFO("live Y %d", saf_live_picker_y());
     if (saf_picker != 0) MENU_SET_WARNING(MENU_WARN_INFO, "Only used with PD picker = Canon (mode 4 uses picker 2).");
     else MENU_SET_WARNING(MENU_WARN_INFO, "mcm only. Restart LiveView after changing. Applied: op8 %d, Y %+d, X %+d.",
         saf_pe[1].a8 ? saf_pe[1].a8 : 180, saf_pe[1].ay, saf_pe[1].ax);
