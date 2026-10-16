@@ -564,6 +564,45 @@ static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
  * (that trips the SAF.c:298 assert straight away). */
 static int saf_latched_mode = 0, saf_latched_dx = 0, saf_latched_dy = 0;
 
+/* Picker grid. CalcPickerWindow (FF27E7EC) places the phase-detect picker window on a fixed
+ * grid from the per-mode table at RAM 0x95F30 (8 halfwords per mode):
+ *   0 width, 1 height, 2 x min (= x grid base), 3 x max, 4 y min, 5 y max, 6 y grid base, 7 y period
+ *   y = [6] + ShiftPattern * ystep[mode] + k * [7]     (ystep at 0x95EB0: 60/20/12 for 1:1 / 3-skip / 5-skip)
+ * so shifting the WIN rectangle only jumps between Canon's bands (140 rows apart in mode 3).
+ * These offsets move the whole grid (base and limits) for the mode used, at LiveView start. */
+#define SAF_PGRID(m)        ((volatile int16_t *)(0x95F30 + 16 * (m)))
+static int saf_grid_dy = 0, saf_grid_dx = 0;        /* menu, rows / columns (multiples of 4) */
+static int16_t saf_grid_orig[9][6];
+static int saf_grid_orig_ok[9];
+static int saf_grid_used_mode = -1, saf_grid_used_dx = 0, saf_grid_used_dy = 0;
+
+static void saf_grid_apply(int mode)
+{
+    /* restore every mode we touched, then shift the one in use */
+    for (int m = 1; m <= 5; m++)
+    {
+        volatile int16_t * t = SAF_PGRID(m);
+        if (!saf_grid_orig_ok[m])
+        {
+            for (int i = 0; i < 6; i++) saf_grid_orig[m][i] = t[2 + i];
+            saf_grid_orig_ok[m] = 1;
+        }
+        for (int i = 0; i < 6; i++) t[2 + i] = saf_grid_orig[m][i];
+    }
+    saf_grid_used_mode = mode; saf_grid_used_dx = 0; saf_grid_used_dy = 0;
+    if (mode < 1 || mode > 5 || !is_mcm_preset(crop_preset)) return;
+    int16_t * o = saf_grid_orig[mode];
+    int dx = saf_grid_dx, dy = saf_grid_dy;
+    if (o[0] + dx < 0) dx = -o[0];
+    if (o[2] + dy < 0) dy = -o[2];
+    if (o[4] + dy < 0) dy = -o[4];
+    volatile int16_t * t = SAF_PGRID(mode);
+    t[2] = o[0] + dx; t[3] = o[1] + dx;     /* x min / base, x max */
+    t[4] = o[2] + dy; t[5] = o[3] + dy;     /* y min, y max */
+    t[6] = o[4] + dy;                       /* y base */
+    saf_grid_used_dx = dx; saf_grid_used_dy = dy;
+}
+
 static void saf_modify_param(uint32_t * param, int is_setup)
 {
     if (is_setup)
@@ -572,6 +611,7 @@ static void saf_modify_param(uint32_t * param, int is_setup)
         int mcm = is_mcm_preset(crop_preset);
         saf_latched_dx = mcm ? saf_p2_xshift : 0;
         saf_latched_dy = mcm ? saf_p2_yshift : 0;
+        saf_grid_apply(saf_latched_mode ? saf_latched_mode : (int) param[0]);
     }
     if (saf_latched_mode)
     {
@@ -3158,8 +3198,9 @@ static MENU_SELECT_FUNC(saf_debug_select)
     if (!saf_debug)
     {
         saf_debug_old = SAF_DEBUG_FLAGS;
-        SAF_DEBUG_FLAGS = saf_debug_old | 0x10000085;  /* setup/start, DefocusResult, per-area results,
-                                                          * picker window updates (SafWin / Picker / MC) */
+        SAF_DEBUG_FLAGS = saf_debug_old | 0x10002885;  /* setup/start, DefocusResult, per-area results,
+                                                          * picker window updates (SafWin / Picker / MC),
+                                                          * 0x800 ShiftPattern, 0x2000 Picker rect */
         saf_debug = 1;
         saf_trace_cls = SAF_DEBUG_CLASS & 0xFF;
     }
@@ -3213,6 +3254,21 @@ static int saf_live_picker_y()
             saf_live_picker_b = ((buf[i] & 0x3FF) << 8) + (buf[i + 1] & 0xFF);
     }
     return a;
+}
+
+static MENU_UPDATE_FUNC(saf_grid_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    int ly = saf_live_picker_y();
+    MENU_SET_RINFO("y %d", ly);
+    int m = saf_grid_used_mode;
+    if (m >= 1 && m <= 5)
+    {
+        volatile int16_t * t = SAF_PGRID(m);
+        MENU_SET_WARNING(MENU_WARN_INFO, "mode %d at LV start: dx %+d dy %+d. y base %d min %d period %d, x base %d",
+            m, saf_grid_used_dx, saf_grid_used_dy, t[6], t[4], t[7], t[2]);
+    }
+    else MENU_SET_WARNING(MENU_WARN_INFO, "mode %d at LV start: grid not changed", m);
 }
 
 static MENU_UPDATE_FUNC(saf_p2_menu_update)
@@ -3915,6 +3971,24 @@ static struct menu_entry crop_rec_menu[] =
         .update     = saf_p2_menu_update,
         .help       = "Picker 2 (the one mcm uses with PD picker = Canon): value of command 8,\n"
                       "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
+    },
+    {
+        .name       = "PD grid Y offset",
+        .priv       = &saf_grid_dy,
+        .min        = -140,
+        .max        = 140,
+        .update     = saf_grid_menu_update,
+        .help       = "mcm: moves Canon's phase-detect row grid (all bands) by this many rows.\n"
+                      "Use multiples of 4. Restart LiveView (MENU twice) after changing.\n",
+    },
+    {
+        .name       = "PD grid X offset",
+        .priv       = &saf_grid_dx,
+        .min        = -48,
+        .max        = 48,
+        .update     = saf_grid_menu_update,
+        .help       = "mcm: moves the phase-detect column grid. Multiples of 4.\n"
+                      "Restart LiveView after changing.\n",
     },
     {
         .name       = "PD window Y shift",
