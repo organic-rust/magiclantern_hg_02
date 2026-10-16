@@ -3219,14 +3219,14 @@ static MENU_UPDATE_FUNC(saf_p2_menu_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     int ly = saf_live_picker_y();
-    MENU_SET_RINFO("live %d,%d @%x", ly, saf_live_picker_b, saf_live_picker_ptr);
+    MENU_SET_RINFO("%d,%d", ly, saf_live_picker_b);
     int sy = -1;
     volatile uint16_t * t = saf_pe[1].table;
     for (int i = 0; i < 16; i++)
         if ((t[i] >> 10) == 0x4 && (t[i + 1] >> 10) == 0x3) { sy = ((t[i] & 0x3FF) << 8) + (t[i + 1] & 0xFF); break; }
-    MENU_SET_WARNING(MENU_WARN_INFO, "src ptrs %x %x %x, edited %x (Y %d), applied Y %+d op8 %d",
-        saf_picker_src[0], saf_picker_src[1], saf_picker_src[2], (uint32_t) saf_pe[1].table, sy,
-        saf_pe[1].ay, saf_pe[1].a8 ? saf_pe[1].a8 : 180);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Live picker window 0 (right). WIN shift latched at LV start: x %+d y %+d. starts %d",
+        saf_latched_dx, saf_latched_dy, saf_start_count);
+    (void) sy;
 }
 
 
