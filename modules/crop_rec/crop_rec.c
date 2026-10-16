@@ -3014,6 +3014,21 @@ static void frz_trace_poll()
 {
     if (!frz_trace || !is_EOSM2) return;
 
+    /* after a freeze, save the log by itself once capture has stopped (or 2 s later), so it
+     * survives a battery pull when the camera can't be operated any more */
+    static int autosaved = 0, t_caught = 0;
+    if (frz_trace == 1) autosaved = 0;
+    if (frz_caught && !autosaved)
+    {
+        if (!t_caught) t_caught = get_ms_clock();
+        if (dmlog_w >= frz_stop_at || get_ms_clock() - t_caught > 2000)
+        {
+            autosaved = 1;
+            t_caught = 0;
+            dmlog_save_as("ML/FRZAUTO.TXT");
+        }
+    }
+
     static uint32_t last_disp = 0, last_lvdma = 0, last_hddma = 0;
     static int t_disp = 0, t_lvdma = 0, t_hddma = 0;
     static int disp_changes = 0;
