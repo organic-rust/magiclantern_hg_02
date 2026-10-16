@@ -636,6 +636,49 @@ static void saf_modify_param(uint32_t * param, int is_setup)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * PATH_Select (RAM 0x193DC, EOS M2 1.0.3): picks the "PathDriveMode" (sensor readout + LiveView
+ * path preset) from a mode struct: S [+8], Z zoom [+0x10], R [+0xC], DZ [+0x18], SM [+0],
+ * SV [+0x28], DT [+0x48], CF [+0x24], [+0x14]. Result in r5 at the common exit (0x197AC),
+ * stored to 0x924DC+0x28/+0x2C. Idle movie LiveView uses a 5x3 path; H.264 1080p recording
+ * switches to a 3x3 path. Overriding the result in standby may give Canon's own 3x3 readout
+ * (with Canon's own phase-detect setup) without crop_rec register rewiring.
+ * --------------------------------------------------------------------------- */
+#define PATH_SEL_ENTRY_ADDR 0x193DC
+#define PATH_SEL_ENTRY_INSN 0xE92D4030      /* push {r4, r5, lr} */
+#define PATH_SEL_EXIT_ADDR  0x197B0
+#define PATH_SEL_EXIT_INSN  0xE594002C      /* ldr r0, [r4, #0x2c]; r5 = selected mode */
+static int path_hook_err = -1;
+static int path_override = -1;              /* -1 = Canon, else force this PathDriveMode */
+static volatile uint32_t path_in[10];       /* S Z R DZ SM SV DT CF [+0x14] */
+static volatile int path_seen = -1, path_used = -1, path_count = 0;
+static volatile int path_seen_idle = -1, path_seen_rec = -1;
+
+static void FAST path_entry_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * st = (uint32_t *) regs[0];
+    if (!st || ((uint32_t) st & 3) || (uint32_t) st > 0x10000000) return;
+    path_in[0] = st[2];  path_in[1] = st[4];  path_in[2] = st[3];  path_in[3] = st[6];
+    path_in[4] = st[0];  path_in[5] = st[10]; path_in[6] = st[18]; path_in[7] = st[9];
+    path_in[8] = st[5];
+}
+
+static void FAST path_exit_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    int mode = regs[5];
+    path_seen = mode;
+    path_count++;
+    if (RECORDING) path_seen_rec = mode; else path_seen_idle = mode;
+    /* only with crop_rec presets off: they rewire the Digital zoom path themselves */
+    if (path_override >= 0 && !RECORDING && crop_presets && CROP_PRESET_MENU == CROP_PRESET_OFF)
+    {
+        regs[5] = path_override;
+    }
+    path_used = regs[5];
+    dmlog_add(0xFFFF, 0, "*** ML-SPY PATH S:%d Z:%x R:%x DZ:%d", path_in[0], path_in[1], path_in[2], path_in[3], 0);
+    dmlog_add(0xFFFF, 0, "*** ML-SPY PATH SM:%d CF:%d [14]:%d -> %d used %d", path_in[4], path_in[7], path_in[8], mode, regs[5]);
+}
+
 #define SAF_START_ADDR      0xFF1020E4
 #define SAF_START_INSN      0xE92D4030      /* push {r4, r5, lr} */
 static int saf_start_hook_err = -1;
@@ -921,6 +964,11 @@ static void mcm_af_update()
     {
         unpatch_memory(SAF_RESULT_EXIT_ADDR);
         saf_drop_patched = 0;
+    }
+    if (path_hook_err == -1)
+    {
+        path_hook_err  = patch_hook_function(PATH_SEL_ENTRY_ADDR, PATH_SEL_ENTRY_INSN, &path_entry_hook, "crop_rec: PATH_Select spy");
+        path_hook_err |= patch_hook_function(PATH_SEL_EXIT_ADDR, PATH_SEL_EXIT_INSN, &path_exit_hook, "crop_rec: PATH_Select result") << 8;
     }
     if (saf_start_hook_err == -1)
     {
@@ -3263,6 +3311,17 @@ static void frz_trace_poll()
     }
 }
 
+static MENU_UPDATE_FUNC(path_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (path_hook_err > 0) { MENU_SET_RINFO("ERR %x", path_hook_err); return; }
+    if (path_override < 0) MENU_SET_VALUE("Canon");
+    else MENU_SET_VALUE("%d", path_override);
+    MENU_SET_RINFO("Canon %d, used %d", path_seen, path_used);
+    MENU_SET_WARNING(MENU_WARN_INFO, "idle %d rec %d (%d). S%d Z%x R%x DZ%d SM%d CF%d [14]%d. Preset OFF, restart LV.",
+        path_seen_idle, path_seen_rec, path_count, path_in[0], path_in[1], path_in[2], path_in[3], path_in[4], path_in[7], path_in[8]);
+}
+
 static MENU_UPDATE_FUNC(saf_mode_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
@@ -4050,6 +4109,15 @@ static struct menu_entry crop_rec_menu[] =
         .select     = frz_trace_select,
         .help       = "SET: start logging all Canon messages. Stops itself ~0.7 s after a\n"
                       "LiveView freeze. SET again: save ML/FRZLOG.TXT.\n",
+    },
+    {
+        .name       = "Path drive mode",
+        .priv       = &path_override,
+        .min        = -1,
+        .max        = 31,
+        .update     = path_menu_update,
+        .help       = "Canon's sensor/LiveView path preset (PATH_Select). Record H.264 once to see\n"
+                      "the 'rec' value, then force it here (crop preset OFF) and restart LiveView.\n",
     },
     {
         .name       = "Hybrid AF mode",
