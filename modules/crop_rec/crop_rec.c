@@ -552,21 +552,19 @@ static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 }
 
 
-static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+/* Changes applied to both SAF_SetupCaptureForMovie and SAF_Start parameters (same 24-byte
+ * layout). SAF_Start runs every frame with a parameter block Evf rebuilds from scratch
+ * (mode from the selector again): it asserts that its mode matches the one given at setup
+ * (SAF.c:298 "this->CaptureMode == this->SafParameter.CaptureMode" - the crash behind every
+ * forced mode), and copies its block over the setup one (so a setup-only WIN shift is lost).
+ *   - mode override (mcm only)
+ *   - WIN rectangle shift (param halfwords 7..10 = x, y, w, h; mcm presets only) */
+static void saf_modify_param(uint32_t * param)
 {
-    uint32_t * param = (uint32_t *) regs[0];
-    if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
-    int mode = param[0];
-    saf_seen_mode = mode;
-    saf_seen_count++;
-    /* override only in the mcm presets (Digital zoom readout rewired by crop_rec) */
     if (saf_override && video_mode_crop)
     {
         param[0] = saf_override;
     }
-    /* The live picker window positions are not the default table's: SetPickerWindow (FF27D200,
-     * called from FF27EF14 during this setup) rewrites Y/X from the WIN rectangle passed here
-     * (param halfwords 7..10 = x, y, w, h). Shift that rectangle instead. */
     if (is_mcm_preset(crop_preset) && (saf_p2_yshift || saf_p2_xshift))
     {
         uint16_t * pw = (uint16_t *) param;
@@ -575,6 +573,30 @@ static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         if (y < 0) y = 0;
         pw[7] = x; pw[8] = y;
     }
+}
+
+#define SAF_START_ADDR      0xFF1020E4
+#define SAF_START_INSN      0xE92D4030      /* push {r4, r5, lr} */
+static int saf_start_hook_err = -1;
+static volatile int saf_start_count = 0;
+
+static void FAST saf_start_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * param = (uint32_t *) regs[0];
+    if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
+    saf_start_count++;
+    saf_modify_param(param);
+}
+
+static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t * param = (uint32_t *) regs[0];
+    if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
+    int mode = param[0];
+    saf_seen_mode = mode;
+    saf_seen_count++;
+    /* override only in the mcm presets (Digital zoom readout rewired by crop_rec) */
+    saf_modify_param(param);
     saf_used_mode = param[0];
 
     struct saf_snap * sn = &saf_snap[video_mode_crop ? 1 : 0];
@@ -835,6 +857,10 @@ static void mcm_af_update()
     {
         unpatch_memory(SAF_RESULT_EXIT_ADDR);
         saf_drop_patched = 0;
+    }
+    if (saf_start_hook_err == -1)
+    {
+        saf_start_hook_err = patch_hook_function(SAF_START_ADDR, SAF_START_INSN, &saf_start_hook, "crop_rec: SAF start (mode/WIN)");
     }
     if (saf_result_hook_err == -1)
     {
@@ -3099,6 +3125,7 @@ static MENU_UPDATE_FUNC(saf_mode_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     if (saf_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_hook_err); return; }
+    if (saf_start_hook_err > 0) { MENU_SET_RINFO("start ERR %x", saf_start_hook_err); return; }
     MENU_SET_RINFO("Canon %d, used %d", saf_seen_mode, saf_used_mode);
     MENU_SET_WARNING(MENU_WARN_INFO, "SAF setups %d. Evf in: kind %d, lvmode %d, zoom %x, %d %d %d. Restart LV to apply.",
         saf_seen_count, saf_sel_in[0], saf_sel_in[1], saf_sel_in[2], saf_sel_in[3], saf_sel_in[4], saf_sel_in[5]);
