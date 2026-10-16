@@ -384,7 +384,17 @@ static struct saf_snap saf_snap[2];
 #define SAF_RESULT_ADDR     0xFF27D608
 #define SAF_RESULT_INSN     0xE92D4070      /* push {r4, r5, r6, lr} */
 static int saf_result_hook_err = -1;
-static int saf_pd_ignore = 0;               /* 0 = Canon, 1 = ignore phase detection in mcm */
+static int saf_pd_ignore = 0;               /* 0 = Canon, 1 = zero reliability, 2 = drop results (mcm only) */
+
+/* "Drop": make SAF_DefocusResult return before delivering the result (its own early exit,
+ * FF27D61C popeq -> pop), so AF never receives phase-detect results - the state picker 1
+ * produced by accident (SAF stuck in ACCUMULATION), which gave more reliable contrast AF.
+ * Same cache line as the result hook at FF27D608. Patched only while an mcm preset runs. */
+#define SAF_RESULT_EXIT_ADDR 0xFF27D61C
+#define SAF_RESULT_EXIT_ORIG 0x08BD8070     /* popeq {r4, r5, r6, pc} */
+#define SAF_RESULT_EXIT_NEW  0xE8BD8070     /* pop   {r4, r5, r6, pc} */
+static int saf_drop_patched = 0;
+static int saf_drop_err = 0;
 static volatile int saf_res_count = 0;
 static volatile int saf_res_d0 = 0, saf_res_r0 = 0, saf_res_valid = 0;
 
@@ -398,7 +408,7 @@ static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     int v = 0;
     for (int i = 0; i < 10; i++) if (pk[20 + i]) v++;
     saf_res_valid = v;
-    if (saf_pd_ignore && video_mode_crop)
+    if (saf_pd_ignore == 1 && video_mode_crop)
     {
         for (int i = 0; i < 10; i++) pk[20 + i] = 0;
     }
@@ -699,6 +709,18 @@ static void mcm_af_update()
         saf_hook_err |= patch_hook_function(SAF_SETUP_ADDR, SAF_SETUP_INSN, &saf_setup_hook, "crop_rec: SAF setup mode") << 8;
     }
     saf_picker_update();
+    int want_drop = (saf_pd_ignore == 2) && video_mode_crop && saf_result_hook_err == 0;
+    if (want_drop && !saf_drop_patched && !saf_drop_err)
+    {
+        saf_drop_err = patch_instruction(SAF_RESULT_EXIT_ADDR, SAF_RESULT_EXIT_ORIG, SAF_RESULT_EXIT_NEW,
+            "crop_rec: drop phase-detect results (mcm)");
+        saf_drop_patched = (saf_drop_err == 0);
+    }
+    else if (!want_drop && saf_drop_patched)
+    {
+        unpatch_memory(SAF_RESULT_EXIT_ADDR);
+        saf_drop_patched = 0;
+    }
     if (saf_result_hook_err == -1)
     {
         saf_result_hook_err = patch_hook_function(SAF_RESULT_ADDR, SAF_RESULT_INSN, &saf_result_hook, "crop_rec: SAF result (phase detect)");
@@ -2998,7 +3020,8 @@ static MENU_UPDATE_FUNC(saf_pd_update)
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     if (saf_result_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_result_hook_err); return; }
     MENU_SET_RINFO("D0 %d R0 %x, %d ok", saf_res_d0, saf_res_r0, saf_res_valid);
-    MENU_SET_WARNING(MENU_WARN_INFO, "Phase-detect results so far: %d. Values shown are before Ignore.", saf_res_count);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Phase-detect results so far: %d (shown before Ignore/Drop). drop:%d err:%x",
+        saf_res_count, saf_drop_patched, saf_drop_err);
 }
 
 static MENU_SELECT_FUNC(saf_save_select)
@@ -3663,11 +3686,11 @@ static struct menu_entry crop_rec_menu[] =
     {
         .name       = "Phase detect (mcm)",
         .priv       = &saf_pd_ignore,
-        .max        = 1,
-        .choices    = CHOICES("Canon", "Ignore"),
+        .max        = 2,
+        .choices    = CHOICES("Canon", "Ignore", "Drop"),
         .update     = saf_pd_update,
-        .help       = "Ignore: mark Hybrid AF phase-detect results unreliable in mcm presets,\n"
-                      "so AF uses contrast only. Takes effect immediately.\n",
+        .help       = "mcm only. Ignore: send results marked unreliable. Drop: don't send\n"
+                      "phase-detect results at all (contrast AF only). Immediate.\n",
     },
     {
         .name       = "Save SAF info",
