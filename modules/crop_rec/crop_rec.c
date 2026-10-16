@@ -247,7 +247,7 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
          * Identical consecutive messages are collapsed. */
         if (gmt_trace && cls != DM_MARKER && cls != 154 && cls != 196) return;
         if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
-        if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != saf_trace_cls) return;
+        if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != 145 && cls != saf_trace_cls) return;   /* 145: [REG] sensor register writes */
         if (frz_trace && cls == 21) { dm_cls_count[21]++; return; }   /* register-write spam (~6000/s in mcm) */
         if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
