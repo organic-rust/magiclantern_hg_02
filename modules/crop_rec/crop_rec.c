@@ -396,7 +396,7 @@ static int saf_pd_ignore = 0;               /* 0 = Canon, 1 = zero reliability, 
 static int saf_drop_patched = 0;
 static int saf_drop_err = 0;
 static volatile int saf_res_count = 0;
-static volatile int saf_res_d0 = 0, saf_res_r0 = 0, saf_res_valid = 0;
+static volatile int saf_res_d0 = 0, saf_res_r0 = 0, saf_res_valid = 0, saf_res_fpc = 0;
 #define SAF_HIST_N 32
 static volatile int saf_hist_w = 0;
 static volatile int saf_hist_valid[SAF_HIST_N];
@@ -414,12 +414,17 @@ static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     saf_res_valid = v;
 
     /* quality metrics over the last 32 results: valid areas, D0 frame-to-frame jump */
-    static int last_d0 = 0;
+    /* jump counts only while the lens stands still (focus position, bytes 30..31, unchanged),
+     * so lens movement from AF doesn't count as noise */
+    static int last_d0 = 0, last_fpc = -1;
+    int fpc = (pk[30] << 8) | pk[31];
+    saf_res_fpc = fpc;
     int i = saf_hist_w % SAF_HIST_N;
     saf_hist_valid[i] = v;
     int jump = saf_res_d0 - last_d0; if (jump < 0) jump = -jump;
-    saf_hist_jump[i] = (pk[20] && saf_hist_w) ? jump : -1;
+    saf_hist_jump[i] = (pk[20] && saf_hist_w && fpc == last_fpc) ? jump : -1;
     last_d0 = saf_res_d0;
+    last_fpc = fpc;
     saf_hist_w++;
 
     if (saf_pd_ignore == 1 && video_mode_crop)
@@ -3131,10 +3136,10 @@ static MENU_UPDATE_FUNC(saf_pd_update)
     }
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     if (saf_result_hook_err > 0) { MENU_SET_RINFO("ERR %x", saf_result_hook_err); return; }
-    MENU_SET_RINFO("ok %d.%d jump %d", n ? vsum / n : 0, n ? (vsum * 10 / n) % 10 : 0, jn ? jsum / jn : -1);
+    MENU_SET_RINFO("ok %d.%d jump %d (%d/%d)", n ? vsum / n : 0, n ? (vsum * 10 / n) % 10 : 0, jn ? jsum / jn : -1, jn, n);
     MENU_SET_VALUE("%s D0 %d", saf_pd_ignore == 2 ? "Drop" : saf_pd_ignore ? "Ignore" : "Canon", saf_res_d0);
-    MENU_SET_WARNING(MENU_WARN_INFO, "Phase-detect results so far: %d (shown before Ignore/Drop). drop:%d err:%x",
-        saf_res_count, saf_drop_patched, saf_drop_err);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Results %d, lens pos %d. jump: lens-still frames only (n/32). drop:%d err:%x",
+        saf_res_count, saf_res_fpc, saf_drop_patched, saf_drop_err);
 }
 
 static MENU_SELECT_FUNC(saf_save_select)
