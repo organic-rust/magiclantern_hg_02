@@ -3104,7 +3104,8 @@ static MENU_SELECT_FUNC(saf_debug_select)
     if (!saf_debug)
     {
         saf_debug_old = SAF_DEBUG_FLAGS;
-        SAF_DEBUG_FLAGS = saf_debug_old | 0x85;    /* setup/start, DefocusResult, per-area results */
+        SAF_DEBUG_FLAGS = saf_debug_old | 0x10000085;  /* setup/start, DefocusResult, per-area results,
+                                                          * picker window updates (SafWin / Picker / MC) */
         saf_debug = 1;
         saf_trace_cls = SAF_DEBUG_CLASS & 0xFF;
     }
@@ -3140,6 +3141,7 @@ static MENU_UPDATE_FUNC(saf_p0_shift_update_menu)
 /* Y of the first window in the picker copy SAF is actually using: two copy buffers
  * (pointers at 0xD2520 and 0xD2520+0x54), current one selected by [0x95E58] (u16). */
 static uint32_t saf_live_picker_ptr = 0;
+static int saf_live_picker_b = -1;          /* second coordinate (op6/op5) */
 static int saf_live_picker_y()
 {
     int cur = *(volatile uint16_t *) 0x95E58;
@@ -3147,17 +3149,23 @@ static int saf_live_picker_y()
     saf_live_picker_ptr = (uint32_t) buf;
     /* buffers may be in the uncacheable mirror (0x4xxxxxxx) */
     if (!buf || ((uint32_t) buf & 1) || (uint32_t) buf >= 0x60000000) return -1;
+    int a = -2;
+    saf_live_picker_b = -2;
     for (int i = 0; i < 16; i++)
-        if ((buf[i] >> 10) == 0x4 && (buf[i + 1] >> 10) == 0x3)
-            return ((buf[i] & 0x3FF) << 8) + (buf[i + 1] & 0xFF);
-    return -2;
+    {
+        if (a < 0 && (buf[i] >> 10) == 0x4 && (buf[i + 1] >> 10) == 0x3)
+            a = ((buf[i] & 0x3FF) << 8) + (buf[i + 1] & 0xFF);
+        if (saf_live_picker_b < 0 && (buf[i] >> 10) == 0x6 && (buf[i + 1] >> 10) == 0x5)
+            saf_live_picker_b = ((buf[i] & 0x3FF) << 8) + (buf[i + 1] & 0xFF);
+    }
+    return a;
 }
 
 static MENU_UPDATE_FUNC(saf_p2_menu_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
     int ly = saf_live_picker_y();
-    MENU_SET_RINFO("live Y %d @%x", ly, saf_live_picker_ptr);
+    MENU_SET_RINFO("live %d,%d @%x", ly, saf_live_picker_b, saf_live_picker_ptr);
     int sy = -1;
     volatile uint16_t * t = saf_pe[1].table;
     for (int i = 0; i < 16; i++)
