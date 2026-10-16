@@ -468,7 +468,7 @@ static struct saf_picker_edit saf_pe[2] = {
 };
 static int saf_p0_yshift = 0, saf_p0_xshift = 0;
 static int saf_p2_yshift = 0, saf_p2_xshift = 0, saf_p2_op8 = 0;
-static const int saf_op8_values[] = { 0, 60, 90, 120, 36 };
+static const int saf_op8_values[] = { 0, 60, 90, 120, 36, 240, 360, 540 };
 
 static void saf_picker_edit_apply(struct saf_picker_edit * pe, int yshift, int xshift, int op8)
 {
@@ -3799,8 +3799,8 @@ static struct menu_entry crop_rec_menu[] =
     {
         .name       = "Picker 2 op8",
         .priv       = &saf_p2_op8,
-        .max        = 4,
-        .choices    = CHOICES("Canon (180)", "60", "90", "120", "36"),
+        .max        = 7,
+        .choices    = CHOICES("Canon (180)", "60", "90", "120", "36", "240", "360", "540"),
         .update     = saf_p2_menu_update,
         .help       = "Picker 2 (the one mcm uses with PD picker = Canon): value of command 8,\n"
                       "possibly 180 / vertical line skip. Restart LiveView after changing.\n",
