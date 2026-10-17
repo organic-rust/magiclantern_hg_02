@@ -679,6 +679,48 @@ static void FAST path_exit_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     dmlog_add(0xFFFF, 0, "*** ML-SPY PATH SM:%d CF:%d [14]:%d -> %d used %d", path_in[4], path_in[7], path_in[8], mode, regs[5]);
 }
 
+/* ---------------------------------------------------------------------------
+ * LV defect map (RAM 0x3CB80, LVDEFECT_CTRL_GetDefmData(H, v), EOS M2 1.0.3).
+ * Called at LiveView start with H/v ("HSKIP"/"VSKIP", from the LV mode table: +0x3B4/+0x3B0)
+ * and a map index at [[0x99510]+0x40]. Picks the defect / mark map that Canon's pipeline
+ * loads (ReadEDmacDefCorre). Normal LV: H=0 v=0. Digital zoom / mcm: H=14 v=10.
+ * Some raw types (pipeline stages) of mcm show a bright dot grid with the 1:1 (Digital zoom)
+ * focus-pixel geometry, while mcm's real focus pixels follow the 3x3 pattern: the map may
+ * mark the wrong pixels in mcm - and phase detect may rely on those marks.
+ * The selected pointer is in r4 at 0x3CC20 (just before it is programmed into the EDMAC).
+ * --------------------------------------------------------------------------- */
+#define DEFM_ENTRY_ADDR     0x3CB80
+#define DEFM_ENTRY_INSN     0xE92D41FC      /* push {r2-r8, lr} */
+#define DEFM_SEL_ADDR       0x3CC20
+#define DEFM_SEL_INSN       0xE3A02004      /* mov r2, #4 (r4 = selected map) */
+static int defm_hook_err = -1;
+static int defm_off = 0;                    /* mcm: 1 = load no map (pointer 0) */
+static int defm_h = -1, defm_v = -1;        /* mcm: override H / v (-1 = Canon) */
+static volatile int defm_h_seen = -1, defm_v_seen = -1, defm_idx = -1, defm_count = 0;
+static volatile uint32_t defm_ptr = 0;
+static volatile int defm_rec_h = -1, defm_rec_v = -1, defm_rec_idx = -1;
+
+static void FAST defm_entry_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t c = *(volatile uint32_t *) 0x99510;
+    int idx = (c && c < 0x10000000) ? (int) *(volatile uint32_t *)(c + 0x40) : -1;
+    defm_h_seen = regs[0]; defm_v_seen = regs[1]; defm_idx = idx; defm_count++;
+    if (RECORDING) { defm_rec_h = regs[0]; defm_rec_v = regs[1]; defm_rec_idx = idx; }
+    if (video_mode_crop && !RECORDING)
+    {
+        if (defm_h >= 0) regs[0] = defm_h;
+        if (defm_v >= 0) regs[1] = defm_v;
+    }
+    dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM H %d v %d idx %d -> H %d v %d", defm_h_seen, defm_v_seen, idx, regs[0], regs[1]);
+}
+
+static void FAST defm_sel_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    if (defm_off && video_mode_crop && !RECORDING) regs[4] = 0;
+    defm_ptr = regs[4];
+    dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM map %x", regs[4], 0, 0, 0, 0);
+}
+
 #define SAF_START_ADDR      0xFF1020E4
 #define SAF_START_INSN      0xE92D4030      /* push {r4, r5, lr} */
 static int saf_start_hook_err = -1;
@@ -964,6 +1006,11 @@ static void mcm_af_update()
     {
         unpatch_memory(SAF_RESULT_EXIT_ADDR);
         saf_drop_patched = 0;
+    }
+    if (defm_hook_err == -1)
+    {
+        defm_hook_err  = patch_hook_function(DEFM_ENTRY_ADDR, DEFM_ENTRY_INSN, &defm_entry_hook, "crop_rec: LV defect map spy");
+        defm_hook_err |= patch_hook_function(DEFM_SEL_ADDR, DEFM_SEL_INSN, &defm_sel_hook, "crop_rec: LV defect map select") << 8;
     }
     if (path_hook_err == -1)
     {
@@ -3311,6 +3358,15 @@ static void frz_trace_poll()
     }
 }
 
+static MENU_UPDATE_FUNC(defm_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (defm_hook_err > 0) { MENU_SET_RINFO("ERR %x", defm_hook_err); return; }
+    MENU_SET_RINFO("H%d v%d i%d %x", defm_h_seen, defm_v_seen, defm_idx, defm_ptr);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Loads %d. Last in recording: H%d v%d idx%d. mcm only, restart LiveView.",
+        defm_count, defm_rec_h, defm_rec_v, defm_rec_idx);
+}
+
 static MENU_UPDATE_FUNC(path_menu_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
@@ -4109,6 +4165,31 @@ static struct menu_entry crop_rec_menu[] =
         .select     = frz_trace_select,
         .help       = "SET: start logging all Canon messages. Stops itself ~0.7 s after a\n"
                       "LiveView freeze. SET again: save ML/FRZLOG.TXT.\n",
+    },
+    {
+        .name       = "Defect map (mcm)",
+        .priv       = &defm_off,
+        .max        = 1,
+        .choices    = CHOICES("Canon", "none"),
+        .update     = defm_menu_update,
+        .help       = "LV defect / mark map Canon loads at LiveView start (GetDefmData).\n"
+                      "'none': load no map in mcm. Right: H v index pointer last seen.\n",
+    },
+    {
+        .name       = "Defect map H",
+        .priv       = &defm_h,
+        .min        = -1,
+        .max        = 47,
+        .update     = defm_menu_update,
+        .help       = "mcm: override the map's H skip phase (-1 = Canon, 14 in mcm).\n",
+    },
+    {
+        .name       = "Defect map v",
+        .priv       = &defm_v,
+        .min        = -1,
+        .max        = 47,
+        .update     = defm_menu_update,
+        .help       = "mcm: override the map's v skip phase (-1 = Canon, 10 in mcm).\n",
     },
     {
         .name       = "Path drive mode",
