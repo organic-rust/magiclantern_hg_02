@@ -36,6 +36,9 @@
 #undef RAW_DEBUG_DUMP   /* if you want to save the raw image buffer and the DNG from here */
 #undef RAW_DEBUG_BLACK  /* for checking black level calibration */
 #undef RAW_DEBUG_TYPE   /* this lets you select the raw type (for PREFERRED_RAW_TYPE) from menu */
+#ifdef CONFIG_EOSM2
+#define RAW_DEBUG_TYPE  /* EOS M2: compare Canon's pipeline stages (DEFMARK 0x07 etc.) between video modes */
+#endif
 /* see also RAW_ZEBRA_TEST and RAW_SPOTMETER_TEST in zebra.c */
 
 #ifdef RAW_DEBUG
