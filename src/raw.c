@@ -2618,12 +2618,17 @@ static struct menu_entry debug_menus[] = {
 };
 #endif
 
+#ifdef RAW_DEBUG_TYPE
+/* weak: the "minimal" builds link raw.o without the menu code */
+extern void menu_add( const char * name, struct menu_entry * new_entry, int count ) __attribute__((weak));
+#endif
+
 static void raw_init()
 {
     raw_sem = create_named_semaphore("raw_sem", 1);
     
     #ifdef RAW_DEBUG_TYPE
-    menu_add("Debug", debug_menus, COUNT(debug_menus));
+    if (menu_add) menu_add("Debug", debug_menus, COUNT(debug_menus));
     #endif
 }
 
