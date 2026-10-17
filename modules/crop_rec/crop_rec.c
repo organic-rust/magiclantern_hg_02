@@ -572,6 +572,8 @@ static void FAST saf_select_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
  * used by SAF_Start, so changing the menu while LiveView runs can't make the two disagree
  * (that trips the SAF.c:298 assert straight away). */
 static int saf_latched_mode = 0, saf_latched_dx = 0, saf_latched_dy = 0;
+static int defm_h, defm_v;                  /* skip phase overrides (defined with the defect map hooks) */
+static int saf_latched_h = -1, saf_latched_v = -1;
 
 /* Picker grid. CalcPickerWindow (FF27E7EC) places the phase-detect picker window on a fixed
  * grid from the per-mode table at RAM 0x95F30 (8 halfwords per mode):
@@ -621,7 +623,12 @@ static void saf_modify_param(uint32_t * param, int is_setup)
         saf_latched_dx = mcm ? saf_p2_xshift : 0;
         saf_latched_dy = mcm ? saf_p2_yshift : 0;
         saf_grid_apply(saf_latched_mode ? saf_latched_mode : (int) param[0]);
+        saf_latched_h = video_mode_crop ? defm_h : -1;
+        saf_latched_v = video_mode_crop ? defm_v : -1;
     }
+    /* skip phase H / v (halfwords 2, 3): same values as the LV defect map override */
+    if (saf_latched_h >= 0) ((uint16_t *) param)[2] = saf_latched_h;
+    if (saf_latched_v >= 0) ((uint16_t *) param)[3] = saf_latched_v;
     if (saf_latched_mode)
     {
         param[0] = saf_latched_mode;
@@ -3222,6 +3229,56 @@ static void gmt_trace_poll()
 #define M2_EDMAC_HD_ADDR    0xC0F04108                                  /* HD (YUV) DMA write address */
 
 static int frz_caught = 0;
+
+/* ---------------------------------------------------------------------------
+ * LV mode settings ("RandomData", EOS M2 1.0.3): Evf copies a 0xBF8-byte settings block from
+ * RAM 0xC4868 into a 5-entry ring (pointers at 0xC5460, current index [0x91C94+0x10]) every frame.
+ * It holds e.g. the skip phase H [+0x3B4] / v [+0x3B0] given to both the LV defect map
+ * (GetDefmData) and the phase-detect setup (SAF_Setup "(14,10)" in mcm, "(0,0)" in Canon 3x3).
+ * Dumps of this block in normal LiveView, mcm and Canon's H.264 recording can be diffed offline
+ * to find every setting that differs between mcm and Canon's own 3x3.
+ * --------------------------------------------------------------------------- */
+#define LVS_ADDR    0xC4868
+#define LVS_SIZE    0xBF8
+static int lvs_auto = 0;            /* 1 = also dump once per recording (ML/LVS_R.BIN) */
+static int lvs_last = 0;            /* last dump result, for the menu */
+
+static int lvs_dump(const char * name)
+{
+    uint8_t * buf = malloc(LVS_SIZE + 64);
+    if (!buf) return -1;
+    uint32_t * hdr = (uint32_t *) buf;
+    memset(buf, 0, 64);
+    hdr[0] = 0x3153564C;                                    /* "LVS1" */
+    hdr[1] = LVS_ADDR; hdr[2] = LVS_SIZE;
+    hdr[3] = *(volatile uint32_t *)(0x91C94 + 0x0C);
+    hdr[4] = *(volatile uint32_t *)(0x91C94 + 0x10);
+    hdr[5] = *(volatile uint32_t *)(0x91C94 + 0x14);
+    hdr[6] = video_mode_crop; hdr[7] = RECORDING ? 1 : 0;
+    hdr[8] = shamem_read(0xC0F06800); hdr[9] = shamem_read(0xC0F06804);
+    hdr[10] = lv_dispsize; hdr[11] = crop_preset;
+    memcpy(buf + 64, (void *) LVS_ADDR, LVS_SIZE);
+    FILE * f = FIO_CreateFile(name);
+    if (!f) { free(buf); return -2; }
+    FIO_WriteFile(f, buf, LVS_SIZE + 64);
+    FIO_CloseFile(f);
+    free(buf);
+    return 1;
+}
+
+static void lvs_poll(void)
+{
+    static int t_rec = 0, done = 0;
+    if (!lvs_auto || !is_EOSM2) return;
+    if (!RECORDING) { t_rec = 0; done = 0; return; }
+    int now = get_ms_clock();
+    if (!t_rec) t_rec = now;
+    if (!done && now - t_rec > 2000)
+    {
+        done = 1;
+        lvs_last = lvs_dump("ML/LVS_R.BIN");
+    }
+}
 static void saf_save_file(void);
 static int saf_live_picker_y(void);
 static uint32_t saf_live_picker_ptr;
@@ -3365,6 +3422,29 @@ static MENU_UPDATE_FUNC(defm_menu_update)
     MENU_SET_RINFO("H%d v%d i%d %x", defm_h_seen, defm_v_seen, defm_idx, defm_ptr);
     MENU_SET_WARNING(MENU_WARN_INFO, "Loads %d. Last in recording: H%d v%d idx%d. mcm only, restart LiveView.",
         defm_count, defm_rec_h, defm_rec_v, defm_rec_idx);
+}
+
+static MENU_SELECT_FUNC(lvs_select)
+{
+    if (!is_EOSM2) return;
+    const char * name = video_mode_crop ? "ML/LVS_M.BIN" : "ML/LVS_N.BIN";
+    lvs_last = lvs_dump(name);
+    if (lvs_last > 0) NotifyBox(2000, "Saved %s", name);
+    else NotifyBox(2000, "Dump failed (%d)", lvs_last);
+}
+
+static MENU_UPDATE_FUNC(lvs_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    MENU_SET_VALUE(lvs_auto ? "SET / rec" : "SET");
+    MENU_SET_RINFO("H%d v%d", *(volatile uint16_t *)(LVS_ADDR + 0x3B4), *(volatile uint16_t *)(LVS_ADDR + 0x3B0));
+    MENU_SET_WARNING(MENU_WARN_INFO, "SET: LVS_N.BIN (normal) / LVS_M.BIN (crop). Q: also LVS_R.BIN 2 s into each recording (%s). last %d",
+        lvs_auto ? "ON" : "OFF", lvs_last);
+}
+
+static MENU_SELECT_FUNC(lvs_auto_toggle)
+{
+    lvs_auto = !lvs_auto;
 }
 
 static MENU_UPDATE_FUNC(path_menu_update)
@@ -4167,6 +4247,14 @@ static struct menu_entry crop_rec_menu[] =
                       "LiveView freeze. SET again: save ML/FRZLOG.TXT.\n",
     },
     {
+        .name       = "Dump LV settings",
+        .select     = lvs_select,
+        .select_Q   = lvs_auto_toggle,
+        .update     = lvs_update,
+        .help       = "Saves Canon's LiveView mode settings block (0xC4868) for offline diffing.\n"
+                      "Right: skip phase H/v in it (mcm 14/10, Canon 3x3 0/0).\n",
+    },
+    {
         .name       = "Defect map (mcm)",
         .priv       = &defm_off,
         .max        = 1,
@@ -4181,7 +4269,8 @@ static struct menu_entry crop_rec_menu[] =
         .min        = -1,
         .max        = 47,
         .update     = defm_menu_update,
-        .help       = "mcm: override the map's H skip phase (-1 = Canon, 14 in mcm).\n",
+        .help       = "mcm: override skip phase H for the defect map and phase-detect setup\n"
+                      "(-1 = Canon: 14 in mcm, 0 in Canon's own 3x3). Restart LiveView.\n",
     },
     {
         .name       = "Defect map v",
@@ -4189,7 +4278,8 @@ static struct menu_entry crop_rec_menu[] =
         .min        = -1,
         .max        = 47,
         .update     = defm_menu_update,
-        .help       = "mcm: override the map's v skip phase (-1 = Canon, 10 in mcm).\n",
+        .help       = "mcm: override skip phase v for the defect map and phase-detect setup\n"
+                      "(-1 = Canon: 10 in mcm, 0 in Canon's own 3x3). Restart LiveView.\n",
     },
     {
         .name       = "Path drive mode",
@@ -4443,6 +4533,7 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     gmt_trace_poll();
     frz_trace_poll();
     saf_snap_poll();
+    lvs_poll();
 
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
