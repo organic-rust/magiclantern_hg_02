@@ -3147,6 +3147,15 @@ static char* get_next_raw_movie_file_name()
              * last field gets incremented if there's another video with the same name
              */
             snprintf(filename, sizeof(filename), "%s/M%02d-%02d%02d.MLV", get_cf_dcim_dir(), now.tm_mday, now.tm_hour, COERCE(now.tm_min + number, 0, 99));
+
+            /* LV raw type changed from the default (raw type debug menu): put it in the name,
+             * e.g. R07_1534.MLV = raw type 0x07, 15:34 */
+            extern int raw_lv_get_raw_type();
+            int rt = raw_lv_get_raw_type();
+            if (rt >= 0)
+            {
+                snprintf(filename, sizeof(filename), "%s/R%02X_%02d%02d.MLV", get_cf_dcim_dir(), rt & 0xFF, now.tm_hour, COERCE(now.tm_min + number, 0, 99));
+            }
         }
         
         /* already existing file? */

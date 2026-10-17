@@ -235,6 +235,9 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 #define SHAD_GAIN_REGISTER 0xC0F08030
 
 static int lv_raw_type = PREFERRED_RAW_TYPE;
+
+/* current LiveView raw type (pipeline stage), e.g. for tagging test recordings */
+int raw_lv_get_raw_type() { return (lv_raw_type == PREFERRED_RAW_TYPE) ? -1 : lv_raw_type; }   /* -1 = default */
 static int lv_raw_gain = 0;
 
 /** 
