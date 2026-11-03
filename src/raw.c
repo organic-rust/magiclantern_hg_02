@@ -2037,9 +2037,18 @@ static void raw_lv_isr_reprime()
     isr_cur_dst = 0;
 }
 
+/* set over USB for measurements: -1 = crop_rec decides, 0 = vsync arming, 1 = interrupt mode */
+int raw_isr_mode_override = -1;
+
+static inline int isr_on()
+{
+    int on = (raw_isr_mode_override >= 0) ? raw_isr_mode_override : isr_arm_on;
+    return on && isr_arm_hook_err == 0;
+}
+
 int raw_lv_isr_capture_active()
 {
-    return isr_arm_on && isr_arm_hook_err == 0 && RAW_SLURP;
+    return isr_on() && RAW_SLURP;
 }
 
 void raw_lv_set_capture_buffers(void * a, void * b)
@@ -2064,7 +2073,7 @@ uint32_t raw_lv_get_completed(void ** buf)
 static void raw_isr_arm_next();
 
 /* diagnostics: every call of the handler (time, args, channel state, armed?), read over USB */
-struct raw_isr_log_entry { uint32_t t, r0, r1, busy, ptr, armed; };   /* r1: last completion time (DIGIC timer) */
+struct raw_isr_log_entry { uint32_t t, vsync_arm, completion, busy, ptr, armed; };   /* DIGIC timer values */
 struct { uint32_t magic, w; struct raw_isr_log_entry e[64]; } raw_isr_log = { 0x474C5349 /* "ISLG" */ };
 static volatile int raw_isr_armed = 0;      /* set by raw_isr_arm_next when it started a transfer */
 
@@ -2074,7 +2083,8 @@ static void FAST readout_done_isr_hook(uint32_t* regs, uint32_t* stack, uint32_t
     extern uint32_t edmac_get_base(uint32_t channel) __attribute__((weak));
     struct raw_isr_log_entry * e = &raw_isr_log.e[raw_isr_log.w % 64];
     extern volatile uint32_t raw_slurp_cbr_time __attribute__((weak));
-    e->t = GET_DIGIC_TIMER(); e->r0 = regs[0]; e->r1 = &raw_slurp_cbr_time ? raw_slurp_cbr_time : 0;
+    e->t = GET_DIGIC_TIMER(); e->vsync_arm = raw_slurp_stats.last_arm;
+    e->completion = &raw_slurp_cbr_time ? raw_slurp_cbr_time : 0;
     if (&raw_write_chan && edmac_get_base)
     {
         uint32_t base = edmac_get_base(raw_write_chan);
@@ -2092,7 +2102,7 @@ static void FAST readout_done_isr_hook(uint32_t* regs, uint32_t* stack, uint32_t
 static void raw_slurp_completed(int how)
 {
     if (how != 0) return;                       /* abort / pop: not a completed frame */
-    if (isr_arm_on && !isr_arm_suspend && lv_raw_enabled && RAW_SLURP && isr_cur_dst)
+    if (isr_on() && !isr_arm_suspend && lv_raw_enabled && RAW_SLURP && isr_cur_dst)
     {
         raw_isr_arm_next();
         raw_isr_log.e[(raw_isr_log.w + 63) % 64].armed |= raw_isr_armed << 1;
@@ -2104,7 +2114,7 @@ extern int patch_hook_function(uintptr_t addr, uint32_t orig_instr, patch_hook_f
 
 void raw_lv_isr_arm(int on)
 {
-    if (on && isr_arm_hook_err == -1 && patch_hook_function)
+    if ((on || raw_isr_mode_override >= 0) && isr_arm_hook_err == -1 && patch_hook_function)
     {
         isr_arm_hook_err = patch_hook_function(READOUT_DONE_ISR_ADDR, READOUT_DONE_ISR_INSN,
             &readout_done_isr_hook, "raw: arm slurp from readout-done interrupt");
@@ -2112,7 +2122,7 @@ void raw_lv_isr_arm(int on)
     isr_arm_on = on && isr_arm_hook_err == 0;
     isr_cur_dst = 0;        /* the next vsync does the full setup again */
     extern void (*raw_slurp_complete_hook)(int) __attribute__((weak));
-    if (&raw_slurp_complete_hook) raw_slurp_complete_hook = isr_arm_on ? raw_slurp_completed : 0;
+    if (&raw_slurp_complete_hook) raw_slurp_complete_hook = raw_slurp_completed;  /* checks isr_on() itself */
 }
 #else
 static const int isr_arm_on = 0;
@@ -2146,6 +2156,10 @@ void FAST raw_lv_vsync()
         last_cbr = cbr;
         /* first frame: full setup from here (callbacks, connection), then the interrupt takes over */
         isr_prime = 1;
+    }
+    else
+    {
+        isr_cur_dst = 0;    /* vsync arming: switching back to interrupt mode re-primes */
     }
 #endif
 

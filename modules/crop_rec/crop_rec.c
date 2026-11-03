@@ -2809,8 +2809,16 @@ if (set_25fps == 0x1)
 static int canon3x3_timers = 1;                 /* readout end: 0 Canon, 1 -1 line (as mcm), 2 -2, 3 -3 */
 static volatile uint32_t canon3x3_seen[4];      /* Canon's 713C, 7150, 6804, 6800 */
 static volatile uint32_t canon3x3_used = 0;
+/* Canon's timing registers as written in this mode (PTP mailbox slot 3 "timers") */
+static const uint32_t c3_regs[] = { 0xC0F06014, 0xC0F06008, 0xC0F0600C, 0xC0F06010, 0xC0F06824,
+    0xC0F0713C, 0xC0F07150, 0xC0F06800, 0xC0F06804, 0xC0F07134, 0xC0F07148, 0xC0F0715C };
+static struct { uint32_t magic, n, writes; uint32_t reg[12], val[12]; } c3_timers = { 0x524D5443 /* "CTMR" */, 12 };
+static volatile uint32_t c3_timers_len = sizeof(c3_timers);
+
 static inline uint32_t reg_override_canon3x3_eosm2(uint32_t reg, uint32_t old_val)
 {
+    for (int i = 0; i < 12; i++)
+        if (c3_regs[i] == reg) { c3_timers.reg[i] = reg; c3_timers.val[i] = old_val; c3_timers.writes++; }
     switch (reg)
     {
         case 0xC0F0713c: canon3x3_seen[0] = old_val; return 0;
@@ -4980,6 +4988,7 @@ static void cr_ptp_init(void)
     ptp_mailbox_set(6, "saf", saf_text, &saf_text_len);
     ptp_mailbox_set(7, "aflog", &pdlog, &aflog_len);
     ptp_mailbox_set(4, "lvci", &lvci, &lvci_len);
+    ptp_mailbox_set(3, "timers", &c3_timers, &c3_timers_len);
 }
 
 static void cr_ptp_poll(void)
