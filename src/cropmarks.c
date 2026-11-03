@@ -532,7 +532,8 @@ static void FAST default_movie_cropmarks()
                 /* default cropmarks are black */
                 /* border pixels should be brighter, to be visible in dark */
                 int border = (x > x1-2 && x < x2+2 && y > y1-2 && y < y2+2);
-                newcolor = border ? COLOR_GRAY(70) : COLOR_BLACK;
+                newcolor = cropmarks_full_frame ? COLOR_TRANSPARENT_BLACK :
+                           border ? COLOR_GRAY(70) : COLOR_BLACK;
             }
             
             if (newcolor)
@@ -560,8 +561,19 @@ static void FAST default_movie_cropmarks()
     }
 }
 
+/* the recorded area covers the whole LiveView image (e.g. EOS M2 1080p 3x3, 3:2): no border
+ * lines at the screen edges, and semi-transparent black outside it, which the info bars pick
+ * up as their background (TOPBAR_BGCOLOR / BOTTOMBAR_BGCOLOR) */
+static int cropmarks_full_frame = 0;
+
 void set_movie_cropmarks(int x, int y, int w, int h)
 {
+    int tol_x = (os.x_max - os.x0) / 100 + 2;
+    int tol_y = (os.y_max - os.y0) / 100 + 2;
+    cropmarks_full_frame =
+        x <= os.x0 + tol_x && x + w >= os.x_max - tol_x &&
+        y <= os.y0 + tol_y && y + h >= os.y_max - tol_y;
+
     x = COERCE(x, os.x0+1, os.x_max-1);
     y = COERCE(y, os.y0+2, os.y_max-2);
     w = COERCE(w, 0, os.x_max-2 - x);
@@ -572,6 +584,7 @@ void set_movie_cropmarks(int x, int y, int w, int h)
 
 void reset_movie_cropmarks()
 {
+    cropmarks_full_frame = 0;
     cropmarks_x = cropmarks_y = -1;
 }
 
