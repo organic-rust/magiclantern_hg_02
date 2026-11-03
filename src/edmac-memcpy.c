@@ -355,8 +355,29 @@ uint32_t raw_write_chan = 0x4;  /* 0x12 gives corrupted frames on 1.2.3, http://
 uint32_t raw_write_chan = 0x3; /* 60D and newer, including all DIGIC V */
 #endif
 
+/* deferred arm (raw.c): when the write channel is still busy at vsync, the next transfer is
+ * started from the completion callback instead of being forced over the running one */
+volatile uint32_t raw_slurp_pending_dst = 0;
+static volatile uint32_t raw_slurp_pending_w = 0, raw_slurp_pending_h = 0;
+volatile uint32_t raw_slurp_deferred_started = 0;
+
+static void raw_slurp_start(void* dst, int w, int h);
+
+void edmac_raw_slurp_defer(void* dst, int w, int h)
+{
+    raw_slurp_pending_w = w; raw_slurp_pending_h = h;
+    raw_slurp_pending_dst = (uint32_t) dst;
+}
+
 static void edmac_slurp_complete_cbr (void* ctx)
 {
+    uint32_t dst = raw_slurp_pending_dst;
+    if (dst)
+    {
+        raw_slurp_pending_dst = 0;
+        raw_slurp_start((void*) dst, raw_slurp_pending_w, raw_slurp_pending_h);
+        raw_slurp_deferred_started++;
+    }
     /* set default CBRs again and stop both DMAs */
     /* idk what to do with those; if I uncomment them, the camera crashes at startup in movie mode with raw_rec enabled */
     //~ UnregisterEDmacCompleteCBR(raw_write_chan);
@@ -365,6 +386,21 @@ static void edmac_slurp_complete_cbr (void* ctx)
 }
 
 void edmac_raw_slurp(void* dst, int w, int h)
+{
+    raw_slurp_pending_dst = 0;      /* a new arm replaces any deferred one */
+
+    /* @g3gg0: this callback does get called */
+    RegisterEDmacCompleteCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
+    RegisterEDmacAbortCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
+    RegisterEDmacPopCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
+    
+    /* connect the selected channels to 0 so the raw data from sensor is passed to write channel */
+    ConnectWriteEDmac(raw_write_chan, 0);
+    
+    raw_slurp_start(dst, w, h);
+}
+
+static void raw_slurp_start(void* dst, int w, int h)
 {
     /* see wiki, register map, EDMAC what the flags mean. they are for setting up copy block size */
 #if defined(CONFIG_650D) || defined(CONFIG_700D) || defined(CONFIG_EOSM) || defined(CONFIG_EOSM2) || defined(CONFIG_100D)
@@ -375,14 +411,6 @@ void edmac_raw_slurp(void* dst, int w, int h)
     uint32_t dmaFlags = EDMAC_8_BYTES_PER_TRANSFER;
 #endif
 
-    /* @g3gg0: this callback does get called */
-    RegisterEDmacCompleteCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
-    RegisterEDmacAbortCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
-    RegisterEDmacPopCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
-    
-    /* connect the selected channels to 0 so the raw data from sensor is passed to write channel */
-    ConnectWriteEDmac(raw_write_chan, 0);
-    
     /* xb is width */
     /* yb is height-1 (number of repetitions) */
     struct edmac_info dst_edmac_info = {

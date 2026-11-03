@@ -1989,7 +1989,7 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 /* see raw_lv_vsync; zeroed by writing magic 0 over USB if needed */
 struct {
     uint32_t magic, arms, busy, min_dt, max_dt, last_arm, last_busy_arm, last_busy_ptr, last_busy_dst;
-    uint32_t waited, wait_timeouts, max_wait_us;   /* aborted, still busy after abort, unused */
+    uint32_t waited, wait_timeouts, max_wait_us;   /* deferred arms (started from the completion CBR), unused, unused */
 } raw_slurp_stats = { 0x534C5253 /* "SRLS" */ };
 
 void FAST raw_lv_vsync()
@@ -2053,15 +2053,18 @@ void FAST raw_lv_vsync()
                      * first rows of the next frame and shifts everything after them (pink frames).
                      * Abort it: the short frame keeps a few stale bottom rows, the next one starts
                      * at row 0. */
-                    extern void AbortEDmac(unsigned int channel) __attribute__((weak));
-                    if (AbortEDmac)
+                    extern void edmac_raw_slurp_defer(void* dst, int w, int h) __attribute__((weak));
+                    if (edmac_raw_slurp_defer)
                     {
-                        AbortEDmac(raw_write_chan);
-                        raw_slurp_stats.waited++;       /* = aborted */
-                        if (MEM(edmac_get_base(raw_write_chan)) & 1) raw_slurp_stats.wait_timeouts++;   /* still busy */
+                        /* the late rows of the previous frame arrive after this hook: start the
+                         * next transfer from the completion callback, once they're in */
+                        edmac_raw_slurp_defer(CACHEABLE(buf), pitch, height);
+                        raw_slurp_stats.waited++;       /* = deferred */
+                        goto slurp_done;
                     }
                 }
                 edmac_raw_slurp(CACHEABLE(buf), pitch, height);
+            slurp_done:;
             }
         }
     }
