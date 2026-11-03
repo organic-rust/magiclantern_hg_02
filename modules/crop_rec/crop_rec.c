@@ -821,6 +821,8 @@ static void FAST defm_sel_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
  * 0x103A0 (offset, offset, src, size): +0x04 (52 bytes; +0x0C = Evf LV mode: 0 in H.264
  * recording, 1 in standby), +0x38 (16), +0x48 (804), +0x36C (40), +0x394 (28), +0x3E8 (18).
  * The LV mode chooses the sensor setup: 3x3 + SAF mode 1 while recording, 5x3 + mode 5 in standby.
+ * Measured: only 4 words of the 52-byte record differ (block +0x08: 2 standby / 4 recording,
+ * +0x0C LV mode 1 / 0, +0x10 1 / 0, +0x18 0 / 1); the other blocks are identical.
  * Here: keep a copy of each block as written in standby and while recording (crop preset off),
  * publish both for diffing (PTP slot 4 "lvci"), and optionally, in standby, write the recorded
  * blocks instead (all, or only the LV mode field). Applies from the next state change: restart
@@ -872,12 +874,17 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (video_mode_crop || (crop_presets && CROP_PRESET_MENU != CROP_PRESET_OFF)) return;
     struct lvci_entry * e = lvci_find(off, size, 1);
     if (!e) return;
-    if (RECORDING)
+    /* Canon writes the new state's blocks just before RECORDING changes, so classify each burst by
+     * its own LV mode (52-byte record first, its +8 = block +0x0C: 0 recording, 1 standby) */
+    static int burst_rec = 0;
+    if (off == 4 && size == 52) burst_rec = (*(const int32_t *)(src + 8) == 0);
+    if (burst_rec)
     {
         memcpy(lvci.pool + e->rec_pos, src, size); e->rec_ok = 1; e->n_rec++;
         return;
     }
     memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
+    if (RECORDING) return;
     if (lvci_override == 1 && e->rec_ok)
     {
         regs[2] = (uint32_t)(lvci.pool + e->rec_pos);
