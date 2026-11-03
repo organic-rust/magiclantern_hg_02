@@ -362,6 +362,7 @@ static int saf_hook_err = -1;
 static int saf_override = 0;                /* 0 = Canon; 1..8 = force mode; 9 = phase detection off */
 static volatile int saf_seen_mode = -1;     /* last mode Canon chose */
 static volatile int saf_used_mode = -1;     /* last mode actually passed on */
+static volatile int saf_cur_mode = -1;      /* mode in SAF_Start, every frame */
 static volatile int saf_seen_count = 0;
 static volatile uint32_t saf_sel_in[6];     /* last inputs to the mode selector */
 
@@ -464,7 +465,7 @@ static void FAST aflog_add(const uint8_t * pk)
     r->t = GET_DIGIC_TIMER();
     r->seq = saf_res_count;
     memcpy(r->pkt, pk, 34);
-    r->saf_mode = saf_used_mode;
+    r->saf_mode = (saf_cur_mode >= 0) ? saf_cur_mode : saf_used_mode;
     r->flags = (video_mode_crop ? 1 : 0) | (RECORDING ? 2 : 0) | (get_halfshutter_pressed() ? 4 : 0)
              | (movie_servo_af ? 8 : 0) | ((saf_pd_ignore == 1 && video_mode_crop) ? 16 : 0)
              | (saf_drop_patched ? 32 : 0);
@@ -823,6 +824,7 @@ static void FAST saf_start_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (!param || ((uint32_t) param & 3) || (uint32_t) param > 0x10000000) return;
     saf_start_count++;
     saf_modify_param(param, 0);
+    saf_cur_mode = param[0];    /* mode of the frame being measured (for the AF log) */
 }
 
 static void FAST saf_setup_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
@@ -3726,6 +3728,81 @@ static MENU_SELECT_FUNC(aflog_menu_select)
     aflog_enable(!pdlog.enabled);
 }
 
+/* AF log -> ML/AFLOGnn.CSV (same columns as ptp_ml.py aflog); returns lines written, < 0 on error */
+static char aflog_last_file[32];
+static int aflog_save_csv(void)
+{
+    if (!pdlog.ring) return -1;
+    char name[32];
+    int k;
+    for (k = 0; k < 100; k++)
+    {
+        snprintf(name, sizeof(name), "ML/AFLOG%02d.CSV", k);
+        uint32_t size;
+        if (FIO_GetFileSize(name, &size) != 0) break;
+    }
+    if (k == 100) return -2;
+    FILE * f = FIO_CreateFile(name);
+    if (!f) return -3;
+
+    const int BUFSZ = 16384;
+    char * buf = malloc(BUFSZ);
+    if (!buf) { FIO_CloseFile(f); return -4; }
+    int len = snprintf(buf, BUFSZ, "seq,t_us,frame,saf_mode,flags,af_mode,waku_st,waku_sub,iso,tv,av,"
+        "focus_pos,focus_dist_cm,pd_lens_pos,pd_extra,valid_areas,"
+        "d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,r0,r1,r2,r3,r4,r5,r6,r7,r8,r9\n");
+
+    uint32_t w = pdlog.w;
+    uint32_t start = (w > PDLOG_N) ? w - PDLOG_N : 0;
+    static const char * fl_names[] = { "crop", "rec", "half", "servo", "ignored", "dropped" };
+    int lines = 0;
+    for (uint32_t i = start; i < w; i++)
+    {
+        struct aflog_rec * r = &pdlog.ring[i % PDLOG_N];
+        char fl[48]; int fl_len = 0; fl[0] = 0;
+        for (int b = 0; b < 6; b++)
+            if (r->flags & (1 << b))
+                fl_len += snprintf(fl + fl_len, sizeof(fl) - fl_len, "%s%s", fl_len ? "+" : "", fl_names[b]);
+        if (!fl_len) snprintf(fl, sizeof(fl), "-");
+        int valid = 0;
+        for (int a = 0; a < 10; a++) if (r->pkt[20 + a]) valid++;
+        len += snprintf(buf + len, BUFSZ - len, "%d,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+            r->seq, r->t & 0xFFFFF, r->frames, r->saf_mode, fl, r->af_mode, r->waku_st, r->waku_sub,
+            r->iso, r->tv, r->av, r->focus_pos, r->focus_dist,
+            (r->pkt[30] << 8) | r->pkt[31], (r->pkt[32] << 8) | r->pkt[33], valid);
+        for (int a = 0; a < 10; a++)
+            len += snprintf(buf + len, BUFSZ - len, ",%d", (int16_t)((r->pkt[2 * a] << 8) | r->pkt[2 * a + 1]));
+        for (int a = 0; a < 10; a++)
+            len += snprintf(buf + len, BUFSZ - len, ",%d", r->pkt[20 + a]);
+        buf[len++] = '\n';
+        lines++;
+        if (len > BUFSZ - 512) { FIO_WriteFile(f, buf, len); len = 0; }
+    }
+    if (len) FIO_WriteFile(f, buf, len);
+    FIO_CloseFile(f);
+    free(buf);
+    snprintf(aflog_last_file, sizeof(aflog_last_file), "%s", name);
+    return lines;
+}
+
+static void aflog_save_notify(void)
+{
+    int n = aflog_save_csv();
+    if (n >= 0) NotifyBox(3000, "AF log: %d records -> %s", n, aflog_last_file);
+    else NotifyBox(3000, "AF log not saved (%d)", n);
+}
+
+static MENU_SELECT_FUNC(aflog_save_select)
+{
+    aflog_save_notify();
+}
+
+static MENU_UPDATE_FUNC(aflog_save_update)
+{
+    if (!pdlog.ring) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Turn on AF log first.");
+    else if (aflog_last_file[0]) MENU_SET_RINFO("%s", aflog_last_file + 3);
+}
+
 static MENU_UPDATE_FUNC(aflog_menu_update)
 {
     MENU_SET_VALUE(pdlog.enabled ? "ON" : "OFF");
@@ -4514,6 +4591,12 @@ static struct menu_entry crop_rec_menu[] =
                       "Read over USB: contrib/ptp/ptp_ml.py aflog (or aflog --follow).\n",
     },
     {
+        .name       = "Save AF log",
+        .select     = aflog_save_select,
+        .update     = aflog_save_update,
+        .help       = "Writes the AF log (up to the last ~68 s) to ML/AFLOGnn.CSV.\n",
+    },
+    {
         .name       = "Save SAF info",
         .select     = saf_save_select,
         .help       = "Writes ML/SAF.TXT: Hybrid AF setup seen without and with Digital zoom.\n",
@@ -4645,7 +4728,7 @@ static void set_zoom(int zoom)
  *   slot 7 "aflog":   AF log ring (struct aflog_rec per phase-detect result)
  * cmd: written by the host, handled here: 1 start Freeze trace, 2 pause
  * capture, 3 resume capture, 4 save SAF.TXT on the card, 5 AF log on,
- * 6 AF log off, 7 clear the AF log.
+ * 6 AF log off, 7 clear the AF log, 8 save the AF log to ML/AFLOGnn.CSV.
  * --------------------------------------------------------------------------- */
 extern WEAK_FUNC(ret_0) void ptp_mailbox_set(int slot, const char *name, void *ptr, volatile uint32_t *len);
 
@@ -4706,6 +4789,7 @@ static void cr_ptp_poll(void)
         case 5: aflog_enable(1); break;
         case 6: aflog_enable(0); break;
         case 7: pdlog.w = 0; break;
+        case 8: aflog_save_csv(); break;
     }
     cr_ptp.cmd_done = cmd;
 }

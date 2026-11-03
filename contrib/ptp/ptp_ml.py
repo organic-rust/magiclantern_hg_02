@@ -15,7 +15,8 @@
                                        crop_rec: start the Freeze trace, pause / resume
                                        capture, write ML/SAF.TXT
   ptp_ml.py saf                        crop_rec's Hybrid AF (SAF) info, as ML/SAF.TXT
-  ptp_ml.py aflog start|stop|clear     crop_rec's AF log (one record per phase-detect result)
+  ptp_ml.py aflog start|stop|clear|save  crop_rec's AF log (one record per phase-detect
+                                       result); save: ML/AFLOGnn.CSV on the card
   ptp_ml.py aflog [FILE.csv]           dump it as CSV (--last N); --follow: print new
                                        records live (Ctrl-C to stop)
   ptp_ml.py lvs [FILE]                 Canon's LV settings block (0xC4868, 0xBF8 bytes),
@@ -294,7 +295,7 @@ class PTP:
         """drain Canon's event queue (EOS Utility polls it all the time)"""
         return self.transact(PTP_OC_EOS_GetEvent, [], expect_data=True)[0]
 
-    def remote_lv(self, on):
+    def remote_lv(self, on, outputs=(3, 2)):
         if on:
             self.transact(PTP_OC_EOS_SetRemoteMode, [1])
             self.transact(PTP_OC_EOS_SetEventMode, [1])
@@ -304,7 +305,7 @@ class PTP:
             except RuntimeError:
                 pass    # not all models have it
             # camera screen + PC; fall back to PC only
-            for value in (3, 2):
+            for value in outputs:
                 try:
                     self.eos_setprop(PTP_DPC_EOS_EVFOutputDevice, value)
                     return value
@@ -537,15 +538,16 @@ def pdlog_read(ptp, n, ring, start, end):
 def aflog_cmd(ptp, a):
     import time
     sub = a.args[0] if a.args else ""
-    if sub in ("start", "stop", "clear"):
+    if sub in ("start", "stop", "clear", "save"):
         base, _ = cr_slot(ptp, a.sym)
-        cmd = {"start": 5, "stop": 6, "clear": 7}[sub]
+        cmd = {"start": 5, "stop": 6, "clear": 7, "save": 8}[sub]
         ptp.write32(base + CR_CMD, cmd)
         for _ in range(30):
             time.sleep(0.1)
             if ptp.words(base + CR_CMD)[0] == 0:
                 _, n, ring, w, en = pdlog_header(ptp, a.sym)
-                print(f"AF log {'on' if en else 'off'}, {w} records")
+                print(f"AF log {'on' if en else 'off'}, {w} records"
+                      + (" (saved to the next free B:/ML/AFLOGnn.CSV)" if sub == "save" else ""))
                 return
         print("not handled yet (crop_rec's polling not running?)")
         return
@@ -612,6 +614,10 @@ def crlog(ptp, sym, last=0):
     return "\n".join(lines) + "\n"
 
 
+def num_arg(v):
+    return int(v, 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sym", default=DEFAULT_SYM)
@@ -622,10 +628,14 @@ def main():
                                     "put", "rm", "mkdir", "mv", "install",
                                     "crlog", "crcmd", "saf", "lvs", "aflog"])
     ap.add_argument("--follow", action="store_true", help="aflog: keep printing new records")
+    ap.add_argument("--lv-out", type=num_arg, default=None, metavar="N",
+                    help="EVF output device for --lv (bitmask: 1 camera screen, 2 PC; default 1, then 3, 2)")
     ap.add_argument("--slot", default="saf", help="mailbox slot for the log command")
     ap.add_argument("--last", type=int, default=0, help="crlog: only the newest N entries")
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
+    # M2: output 1 (camera screen only) keeps the LCD live; 3 (screen + PC) left it black
+    lv_outputs = (a.lv_out,) if a.lv_out is not None else (1, 3, 2)
     num = lambda s: int(s, 0)
 
     ptp = PTP()
@@ -633,7 +643,7 @@ def main():
     try:
         if a.lv or a.cmd == "lv":
             import time
-            value = ptp.remote_lv(True)
+            value = ptp.remote_lv(True, lv_outputs)
             lv_on = True
             wait = a.lv or (float(a.args[0]) if a.args else 3)
             t_end = time.time() + wait

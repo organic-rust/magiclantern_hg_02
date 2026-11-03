@@ -16,9 +16,11 @@ build to the card: the mailbox address comes from platform/EOSM2.103/magiclanter
     ./ptp_ml.py saf                # Hybrid AF (SAF) info
     ./ptp_ml.py aflog start        # AF log: one record per phase-detect result
     ./ptp_ml.py aflog --follow     # print records live as CSV (or aflog AF.csv)
+    ./ptp_ml.py aflog save         # write ML/AFLOGnn.CSV on the card (also in the menu)
     ./ptp_ml.py lvs LVS_M.BIN      # Canon's LV settings block
     ./ptp_ml.py ls B:/ML/          # card files; get / put / install
     ./ptp_ml.py console            # ML console text
 
 Connecting USB normally leaves LiveView; `--lv SECONDS` starts Canon's remote
-LiveView first (EOS Utility style) - not yet tried on the M2.
+LiveView first (EOS Utility style). On the M2 it uses EVF output 1 (camera
+screen only): output 3 (screen + PC) leaves the LCD black. --lv-out N overrides.
