@@ -192,8 +192,16 @@ class PTP:
     def download_ranged(self, camfile, out, size, progress=True):
         """stream a file of any size to the open file `out`"""
         done = 0
+        chunk = RANGE_CHUNK
         while done < size:
-            data = self.read_range(camfile, done, min(RANGE_CHUNK, size - done))
+            try:
+                data = self.read_range(camfile, done, min(chunk, size - done))
+            except RuntimeError:
+                # the camera stages each read in one buffer; on the M2 large ones may not fit
+                if chunk <= 64 << 10:
+                    raise
+                chunk //= 2
+                continue
             if not data:
                 raise RuntimeError(f"read of {camfile} at {done} returned nothing")
             out.write(data)
