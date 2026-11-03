@@ -150,6 +150,8 @@
 
 /** this method bypasses Canon's lv_save_raw and slurps the raw data directly from connection #0 */
 #define CONFIG_EDMAC_RAW_SLURP
+/** EOS M2: Canon's lv_save_raw is also built in; Debug > Raw capture picks one */
+#define CONFIG_EDMAC_RAW_SLURP_OPTIONAL
 
 /** Long-pressing SET/Q opens submenus */
 #define CONFIG_LONG_PRESS_SET_MENU

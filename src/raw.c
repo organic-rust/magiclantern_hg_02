@@ -26,6 +26,7 @@
 #include "lens.h"
 #include "module.h"
 #include "menu.h"
+#include "config.h"
 #include "edmac-memcpy.h"
 #include "imgconv.h"
 #include "console.h"
@@ -78,9 +79,27 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 
 /*********************** Camera-specific constants ****************************/
 
+/* CONFIG_EDMAC_RAW_SLURP_OPTIONAL (internals.h): both raw capture methods are built in,
+ * chosen from the menu ("Raw capture", Debug) each time the LV raw stream is enabled:
+ *   EDMAC slurp:   ML copies the raw data itself (edmac_raw_slurp) into its own buffer
+ *   lv_save_raw:   Canon's own raw path; ML reads Canon's buffer from RAW_LV_EDMAC */
+#if defined(CONFIG_EDMAC_RAW_SLURP) && defined(CONFIG_EDMAC_RAW_SLURP_OPTIONAL)
+#define RAW_HAVE_SAVE_RAW
+static CONFIG_INT("raw.slurp", raw_slurp_menu, 1);
+static int raw_slurp_active = 1;    /* latched in raw_lv_enable */
+#define RAW_SLURP (raw_slurp_active)
+#elif defined(CONFIG_EDMAC_RAW_SLURP)
+#define RAW_SLURP 1
+#else
+#define RAW_HAVE_SAVE_RAW
+#define RAW_SLURP 0
+#endif
+
 #ifdef CONFIG_EDMAC_RAW_SLURP
 /* undefine so we don't use it by mistake */
+#ifndef RAW_HAVE_SAVE_RAW
 #undef RAW_LV_EDMAC
+#endif
 
 /* hardcode Canon's raw buffer directly */
 /* you can find it from lv_raw_dump, arg1 passed to dump_file:
@@ -168,8 +187,9 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 #define CONFIG_ALLOCATE_RAW_LV_BUFFER
 #define RAW_LV_BUFFER_ALLOC_SIZE (raw_info.width * raw_info.height * 14 / 8 + 0x1000)
 
+#endif  /* CONFIG_EDMAC_RAW_SLURP */
 
-#else // "Traditional" RAW LV buffer detection (no CONFIG_EDMAC_RAW_SLURP)
+#ifdef RAW_HAVE_SAVE_RAW // "Traditional" RAW LV buffer detection (Canon's lv_save_raw)
 
 /**
  * LiveView raw buffer address
@@ -189,7 +209,7 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 #define RAW_LV_EDMAC 0xC0F26208
 #endif
 
-#endif  /* no CONFIG_EDMAC_RAW_SLURP */
+#endif  /* RAW_HAVE_SAVE_RAW */
 
 /**
  * Photo-mode raw buffer address
@@ -533,16 +553,19 @@ static int raw_lv_buffer_size = 0;
 /* our default LiveView buffer (which can be DEFAULT_RAW_BUFFER or allocated) */
 static void* raw_get_default_lv_buffer()
 {
-#if !defined(CONFIG_EDMAC_RAW_SLURP)
+#ifdef CONFIG_EDMAC_RAW_SLURP
+    if (RAW_SLURP) return CACHEABLE(raw_lv_buffer);
+#endif
+#ifdef RAW_HAVE_SAVE_RAW
     return CACHEABLE(shamem_read(RAW_LV_EDMAC));
-#else
-    return CACHEABLE(raw_lv_buffer);
 #endif
 }
 /* returns 1 on success */
 static int raw_lv_get_resolution(int* width, int* height)
 {
 #ifdef CONFIG_EDMAC_RAW_SLURP
+  if (RAW_SLURP)
+  {
     /*
      * from adtg_gui.c:
      * {0xC0F0,   0x6800, 0, "RAW first line|column. Column is / 8 on 5D3 (parallel readout?)"},
@@ -602,8 +625,11 @@ static int raw_lv_get_resolution(int* width, int* height)
 #endif
 
     return 1;
+  }
+#endif
 
-#else
+#ifdef RAW_HAVE_SAVE_RAW
+  {
     /* autodetect raw size from EDMAC */
     uint32_t lv_raw_height = shamem_read(RAW_LV_EDMAC+4);
     uint32_t lv_raw_size = shamem_read(RAW_LV_EDMAC+8);
@@ -615,6 +641,7 @@ static int raw_lv_get_resolution(int* width, int* height)
     /* 5D2 uses lv_raw_size >> 16, 5D3 uses lv_raw_height, so this hopefully covers both cases */
     *height = MAX((lv_raw_height & 0xFFFF) + 1, ((lv_raw_size >> 16) & 0xFFFF) + 1);
     return 1;
+  }
 #endif
 }
 
@@ -802,7 +829,7 @@ int raw_update_params_work()
         #endif
 
         #ifdef CONFIG_EDMAC_RAW_SLURP
-        raw_lv_realloc_buffer();
+        if (RAW_SLURP) raw_lv_realloc_buffer();
         #endif
 
         raw_info.buffer = raw_get_default_lv_buffer();
@@ -1904,8 +1931,13 @@ static void* redirected_raw_buffer = 0;
 void FAST raw_lv_redirect_edmac(void* ptr)
 {
     #ifdef CONFIG_EDMAC_RAW_SLURP
-    redirected_raw_buffer = (void*) CACHEABLE(ptr);
-    #else
+    if (RAW_SLURP)
+    {
+        redirected_raw_buffer = (void*) CACHEABLE(ptr);
+        return;
+    }
+    #endif
+    #ifdef RAW_HAVE_SAVE_RAW
     MEM(RAW_LV_EDMAC) = (intptr_t) CACHEABLE(ptr);
     #endif
 }
@@ -1915,6 +1947,13 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 void FAST raw_lv_vsync()
 {
     /* where should we save the raw data? */
+    if (!RAW_SLURP)
+    {
+        /* Canon's lv_save_raw fills its own buffer */
+        redirected_raw_buffer = 0;
+        return;
+    }
+
     void* buf = redirected_raw_buffer ? redirected_raw_buffer : raw_get_default_lv_buffer();
     
     if (buf && lv_raw_enabled)
@@ -2243,10 +2282,16 @@ static void raw_lv_enable()
     /* if enabled too early, right after the property is fired, the raw stream may not come up (race condition in Canon code?) */
     wait_lv_frames(2);
     
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+    /* the method can only change while the raw stream is off */
+    raw_slurp_active = raw_slurp_menu;
+    printf("LV raw: %s\n", raw_slurp_active ? "EDMAC slurp" : "lv_save_raw");
+#endif
+
     lv_raw_enabled = 1;
 
-#ifndef CONFIG_EDMAC_RAW_SLURP
-    call("lv_save_raw", 1);
+#ifdef RAW_HAVE_SAVE_RAW
+    if (!RAW_SLURP) call("lv_save_raw", 1);
 #endif
 
 #ifdef DEFAULT_RAW_BUFFER
@@ -2277,7 +2322,7 @@ static void raw_lv_enable()
 #endif
 
 #ifdef CONFIG_EDMAC_RAW_SLURP
-    raw_lv_realloc_buffer();
+    if (RAW_SLURP) raw_lv_realloc_buffer();
 #endif
 }
 
@@ -2287,12 +2332,12 @@ static void raw_lv_disable()
     lv_raw_enabled = 0;
     raw_info.buffer = 0;
 
-#ifndef CONFIG_EDMAC_RAW_SLURP
-    call("lv_save_raw", 0);
+#ifdef RAW_HAVE_SAVE_RAW
+    if (!RAW_SLURP) call("lv_save_raw", 0);
 #endif
 
 #ifdef CONFIG_ALLOCATE_RAW_LV_BUFFER
-    raw_lv_free_buffer();
+    if (RAW_SLURP) raw_lv_free_buffer();
 #endif
 }
 
@@ -2605,11 +2650,34 @@ PROP_HANDLER(PROP_LV_DISPSIZE)
     #endif
 }
 
-#ifdef RAW_DEBUG_TYPE
-#ifndef CONFIG_EDMAC_RAW_SLURP
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+static MENU_UPDATE_FUNC(raw_slurp_update)
+{
+    if (lv_raw_enabled && raw_slurp_menu != raw_slurp_active)
+        MENU_SET_WARNING(MENU_WARN_INFO, "Active: %s. Applies when the raw stream restarts (LiveView off/on).",
+            raw_slurp_active ? "EDMAC slurp" : "lv_save_raw");
+    else if (lv_raw_enabled)
+        MENU_SET_WARNING(MENU_WARN_INFO, "Active now (raw stream on).");
+}
+#endif
+
+#if defined(RAW_DEBUG_TYPE) || defined(CONFIG_EDMAC_RAW_SLURP_OPTIONAL)
+#if defined(RAW_DEBUG_TYPE) && !defined(CONFIG_EDMAC_RAW_SLURP)
     #error Only implemented for CONFIG_EDMAC_RAW_SLURP.
 #endif
 static struct menu_entry debug_menus[] = {
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+    {
+        .name = "Raw capture",
+        .priv = &raw_slurp_menu,
+        .max  = 1,
+        .choices = CHOICES("lv_save_raw (Canon)", "EDMAC slurp (ML)"),
+        .update = raw_slurp_update,
+        .help = "How LiveView raw frames are captured. EDMAC slurp: ML copies them into",
+        .help2 = "its own buffer (default). lv_save_raw: Canon's own raw path and buffer.",
+    },
+#endif
+#ifdef RAW_DEBUG_TYPE
     {
         .name = "LV raw type",
         .priv = &lv_raw_type,
@@ -2618,10 +2686,11 @@ static struct menu_entry debug_menus[] = {
         .help = "Choose what type of raw stream we should use in LiveView.",
         .help2 = "See lv_af_raw, lv_rshd_raw, lv_set_raw, KindOfCraw...",
     },
+#endif
 };
 #endif
 
-#ifdef RAW_DEBUG_TYPE
+#if defined(RAW_DEBUG_TYPE) || defined(CONFIG_EDMAC_RAW_SLURP_OPTIONAL)
 /* weak: the "minimal" builds link raw.o without the menu code */
 extern void menu_add( const char * name, struct menu_entry * new_entry, int count ) __attribute__((weak));
 #endif
@@ -2630,7 +2699,7 @@ static void raw_init()
 {
     raw_sem = create_named_semaphore("raw_sem", 1);
     
-    #ifdef RAW_DEBUG_TYPE
+    #if defined(RAW_DEBUG_TYPE) || defined(CONFIG_EDMAC_RAW_SLURP_OPTIONAL)
     if (menu_add) menu_add("Debug", debug_menus, COUNT(debug_menus));
     #endif
 }
