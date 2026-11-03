@@ -21,6 +21,8 @@
                                        records live (Ctrl-C to stop)
   ptp_ml.py lvs [FILE]                 Canon's LV settings block (0xC4868, 0xBF8 bytes),
                                        as crop_rec's "Dump LV settings" (LVS1 header)
+  ptp_ml.py lvci                       crop_rec: Canon's LV capture-info blocks, standby vs
+                                       H.264 recording (word-by-word differences)
   ptp_ml.py lv [SECONDS]               remote LiveView test: on, wait, off
   ptp_ml.py get CAMFILE [LOCAL]        download a file from the card
                                        (e.g. B:/DCIM/100CANON/M19-1234.MLV)
@@ -584,6 +586,41 @@ def aflog_cmd(ptp, a):
         pass
 
 
+def lvci_cmd(ptp, sym):
+    """crop_rec.c struct lvci: magic, n_entries, pool_used, 8 x entry (9 words),
+    calls, last_caller, last_off, last_size, pool[2048]"""
+    slots = {name: (ptr, length) for _, name, ptr, length in read_mailbox(ptp, sym)}
+    if "lvci" not in slots:
+        sys.exit("no lvci slot: older crop_rec")
+    base, length = slots["lvci"]
+    raw = ptp.read(base, length)
+    magic, n, used = struct.unpack_from("<III", raw)
+    if magic != 0x3149434C:
+        sys.exit("lvci: magic mismatch")
+    calls, caller, loff, lsize = struct.unpack_from("<IIII", raw, 12 + 8 * 36)
+    pool = raw[12 + 8 * 36 + 16:]
+    print(f"{n} blocks, {calls} writes seen (last from {caller:#x}: +{loff:#x} {lsize} bytes)")
+    for i in range(n):
+        off, size, rec_ok, stb_ok, rpos, spos, n_rec, n_stb, n_used = struct.unpack_from("<9I", raw, 12 + 36 * i)
+        print(f"\n+{off:#05x} ({size} bytes): standby {'yes' if stb_ok else 'no'} ({n_stb} writes), "
+              f"recording {'yes' if rec_ok else 'no'} ({n_rec}), substituted {n_used}")
+        if not (rec_ok and stb_ok):
+            continue
+        rec, stb = pool[rpos:rpos + size], pool[spos:spos + size]
+        diffs = 0
+        for k in range(0, size - size % 4, 4):
+            ws, wr = struct.unpack_from("<I", stb, k)[0], struct.unpack_from("<I", rec, k)[0]
+            if ws != wr:
+                diffs += 1
+                print(f"   block +{off + k:#05x}: standby {ws:#010x} ({ws})  recording {wr:#010x} ({wr})")
+        for k in range(size - size % 4, size):
+            if stb[k] != rec[k]:
+                diffs += 1
+                print(f"   block +{off + k:#05x} (byte): standby {stb[k]:#04x}  recording {rec[k]:#04x}")
+        if not diffs:
+            print("   identical")
+
+
 def crlog(ptp, sym, last=0):
     base, _ = cr_slot(ptp, sym)
     (magic, esize, n, ring, wptr, clsptr, pausedp, frzp, caughtp, gmtp,
@@ -626,7 +663,7 @@ def main():
     ap.add_argument("cmd", choices=["info", "read", "words", "write", "mailbox", "log", "lv",
                                     "get", "findmlv", "ls", "latest", "console",
                                     "put", "rm", "mkdir", "mv", "install",
-                                    "crlog", "crcmd", "saf", "lvs", "aflog"])
+                                    "crlog", "crcmd", "saf", "lvs", "aflog", "lvci"])
     ap.add_argument("--follow", action="store_true", help="aflog: keep printing new records")
     ap.add_argument("--lv-out", type=num_arg, default=None, metavar="N",
                     help="EVF output device for --lv (bitmask: 1 camera screen, 2 PC; default 1, then 3, 2)")
@@ -697,6 +734,8 @@ def main():
                     break
             else:
                 print("not handled yet (is LiveView / crop_rec's polling running?)")
+        elif a.cmd == "lvci":
+            lvci_cmd(ptp, a.sym)
         elif a.cmd == "aflog":
             aflog_cmd(ptp, a)
         elif a.cmd == "saf":

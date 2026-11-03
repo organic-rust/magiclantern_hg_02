@@ -814,6 +814,84 @@ static void FAST defm_sel_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     defm_ptr = regs[4];
 }
 
+/* ---------------------------------------------------------------------------
+ * LV "capture info" (EOS M2 1.0.3). GmtState keeps a 52-byte record per state ("CI Ss Fr CM")
+ * and, on each state change (FF1874F4 and 4 siblings up to FF187B00), copies it and a few more
+ * blocks into Canon's per-frame LiveView settings block (RAM 0xC4868) with the setter at RAM
+ * 0x103A0 (offset, offset, src, size): +0x04 (52 bytes; +0x0C = Evf LV mode: 0 in H.264
+ * recording, 1 in standby), +0x38 (16), +0x48 (804), +0x36C (40), +0x394 (28), +0x3E8 (18).
+ * The LV mode chooses the sensor setup: 3x3 + SAF mode 1 while recording, 5x3 + mode 5 in standby.
+ * Here: keep a copy of each block as written in standby and while recording (crop preset off),
+ * publish both for diffing (PTP slot 4 "lvci"), and optionally, in standby, write the recorded
+ * blocks instead (all, or only the LV mode field). Applies from the next state change: restart
+ * LiveView after changing it.
+ * --------------------------------------------------------------------------- */
+#define LVCI_SET_ADDR       0x103A0
+#define LVCI_SET_INSN       0xE92D4010      /* push {r4, lr} */
+#define LVCI_CALLER_LO      0xFF187400
+#define LVCI_CALLER_HI      0xFF187C00
+#define LVCI_N              8
+#define LVCI_POOL           2048
+static int lvci_hook_err = -1;
+static int lvci_override = 0;               /* 0 Canon, 1 recording blocks, 2 LV mode field only */
+struct lvci_entry {
+    uint32_t off, size;
+    uint32_t rec_ok, stb_ok;                /* captured while recording / in standby */
+    uint32_t rec_pos, stb_pos;              /* offsets into lvci.pool */
+    uint32_t n_rec, n_stb, n_used;          /* writes seen / substituted */
+};
+static struct {
+    uint32_t magic, n_entries, pool_used;
+    struct lvci_entry e[LVCI_N];
+    volatile uint32_t calls, last_caller, last_off, last_size;
+    uint8_t pool[LVCI_POOL];
+} lvci = { 0x3149434C /* "LCI1" */, 0, 0 };
+static volatile uint32_t lvci_len = sizeof(lvci);
+static uint8_t lvci_tmp[64];
+
+static struct lvci_entry * lvci_find(uint32_t off, uint32_t size, int create)
+{
+    for (int i = 0; i < (int) lvci.n_entries; i++)
+        if (lvci.e[i].off == off && lvci.e[i].size == size) return &lvci.e[i];
+    if (!create || lvci.n_entries >= LVCI_N || lvci.pool_used + 2 * size > LVCI_POOL) return 0;
+    struct lvci_entry * e = &lvci.e[lvci.n_entries++];
+    e->off = off; e->size = size;
+    e->rec_pos = lvci.pool_used; e->stb_pos = lvci.pool_used + size;
+    lvci.pool_used += 2 * ((size + 3) & ~3);
+    return e;
+}
+
+static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    uint32_t caller = PATCH_HOOK_CALLER();
+    if (caller < LVCI_CALLER_LO || caller >= LVCI_CALLER_HI) return;
+    uint32_t off = regs[0], size = regs[3];
+    const uint8_t * src = (const uint8_t *) regs[2];
+    if (!src || (uint32_t) src >= 0x60000000 || size == 0 || size > 1024) return;
+    lvci.calls++; lvci.last_caller = caller; lvci.last_off = off; lvci.last_size = size;
+    if (video_mode_crop || (crop_presets && CROP_PRESET_MENU != CROP_PRESET_OFF)) return;
+    struct lvci_entry * e = lvci_find(off, size, 1);
+    if (!e) return;
+    if (RECORDING)
+    {
+        memcpy(lvci.pool + e->rec_pos, src, size); e->rec_ok = 1; e->n_rec++;
+        return;
+    }
+    memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
+    if (lvci_override == 1 && e->rec_ok)
+    {
+        regs[2] = (uint32_t)(lvci.pool + e->rec_pos);
+        e->n_used++;
+    }
+    else if (lvci_override == 2 && off == 4 && size == 52 && e->rec_ok && size <= sizeof(lvci_tmp))
+    {
+        memcpy(lvci_tmp, src, size);
+        memcpy(lvci_tmp + 8, lvci.pool + e->rec_pos + 8, 4);    /* block +0x0C: LV mode */
+        regs[2] = (uint32_t) lvci_tmp;
+        e->n_used++;
+    }
+}
+
 #define SAF_START_ADDR      0xFF1020E4
 #define SAF_START_INSN      0xE92D4030      /* push {r4, r5, lr} */
 static int saf_start_hook_err = -1;
@@ -1105,6 +1183,10 @@ static void mcm_af_update()
     {
         defm_hook_err  = patch_hook_function(DEFM_ENTRY_ADDR, DEFM_ENTRY_INSN, &defm_entry_hook, "crop_rec: LV defect map spy");
         defm_hook_err |= patch_hook_function(DEFM_SEL_ADDR, DEFM_SEL_INSN, &defm_sel_hook, "crop_rec: LV defect map select") << 8;
+    }
+    if (lvci_hook_err == -1)
+    {
+        lvci_hook_err = patch_hook_function(LVCI_SET_ADDR, LVCI_SET_INSN, &lvci_hook, "crop_rec: LV capture info");
     }
     if (path_hook_err == -1)
     {
@@ -3536,6 +3618,22 @@ static MENU_SELECT_FUNC(lvs_auto_toggle)
     lvs_auto = !lvs_auto;
 }
 
+static MENU_UPDATE_FUNC(lvci_menu_update)
+{
+    if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
+    if (lvci_hook_err > 0) { MENU_SET_RINFO("ERR %x", lvci_hook_err); return; }
+    struct lvci_entry * e = lvci_find(4, 52, 0);
+    int rec = e && e->rec_ok, stb = e && e->stb_ok;
+    int mode_rec = rec ? *(int32_t *)(lvci.pool + e->rec_pos + 8) : -1;
+    int mode_stb = stb ? *(int32_t *)(lvci.pool + e->stb_pos + 8) : -1;
+    MENU_SET_RINFO("LV mode stb %d rec %d", mode_stb, mode_rec);
+    if (!rec)
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Record a few s of H.264 first (crop preset OFF) to capture Canon's 3x3 blocks.");
+    else
+        MENU_SET_WARNING(MENU_WARN_INFO, "%d blocks, substituted %d. Crop preset OFF, standby only. Restart LiveView.",
+            lvci.n_entries, e ? e->n_used : 0);
+}
+
 static MENU_UPDATE_FUNC(path_menu_update)
 {
     if (!is_EOSM2) { MENU_SET_VALUE("n/a"); return; }
@@ -4464,6 +4562,15 @@ static struct menu_entry crop_rec_menu[] =
                       "(-1 = Canon: 10 in mcm, 0 in Canon's own 3x3). Restart LiveView.\n",
     },
     {
+        .name       = "LV mode (3x3 test)",
+        .priv       = &lvci_override,
+        .max        = 2,
+        .choices    = CHOICES("Canon", "Recording blocks", "LV mode field only"),
+        .update     = lvci_menu_update,
+        .help       = "Standby LiveView with the capture info Canon uses in H.264 recording\n"
+                      "(3x3 sensor setup?). Record H.264 once first. Preset OFF; restart LiveView.\n",
+    },
+    {
         .name       = "Path drive mode",
         .priv       = &path_override,
         .min        = -1,
@@ -4766,6 +4873,7 @@ static void cr_ptp_init(void)
     ptp_mailbox_set(5, "crtrace", &cr_ptp, &cr_ptp_len);
     ptp_mailbox_set(6, "saf", saf_text, &saf_text_len);
     ptp_mailbox_set(7, "aflog", &pdlog, &aflog_len);
+    ptp_mailbox_set(4, "lvci", &lvci, &lvci_len);
 }
 
 static void cr_ptp_poll(void)
