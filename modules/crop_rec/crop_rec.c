@@ -17,6 +17,7 @@
 extern WEAK_FUNC(ret_0) unsigned int is_crop_hack_supported();
 extern WEAK_FUNC(ret_0) unsigned int movie_crop_hack_enable();
 extern WEAK_FUNC(ret_0) unsigned int movie_crop_hack_disable();
+extern WEAK_FUNC(ret_0) void raw_lv_isr_arm(int on);     /* raw.c, EOS M2: slurp armed from the readout-done interrupt */
 
 #undef CROP_DEBUG
 
@@ -3139,11 +3140,14 @@ static void update_patch()
             patch_hook_function(ENGIO_WRITE, MEM_ENGIO_WRITE, engio_write_hook, "crop_rec: Canon 3x3 frame timers");
             engio_only_active = 1;
         }
+        /* Canon's recording path delays ML's vsync: arm the raw slurp from the interrupt */
+        raw_lv_isr_arm(1);
         if (video_mode_crop) movie_crop_hack_disable();
     }
     else if (CROP_PRESET_MENU && is_movie_mode())
     {
         /* update preset */
+        raw_lv_isr_arm(0);
         crop_preset = CROP_PRESET_MENU;
         if (engio_only_active)
         {
@@ -3183,6 +3187,7 @@ static void update_patch()
             engio_only_active = 0;
             crop_preset = 0;
         }
+        raw_lv_isr_arm(0);
     }
 
     mcm_af_update();

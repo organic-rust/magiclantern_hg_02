@@ -385,6 +385,22 @@ static void edmac_slurp_complete_cbr (void* ctx)
     //~ UnregisterEDmacPopCBR(raw_write_chan);
 }
 
+/* like edmac_raw_slurp, but only programs and starts the channel: for re-arming from an
+ * interrupt after edmac_raw_slurp has set up the callbacks and the connection once */
+void edmac_raw_slurp_restart(void* dst, int w, int h)
+{
+#if defined(CONFIG_650D) || defined(CONFIG_700D) || defined(CONFIG_EOSM) || defined(CONFIG_EOSM2) || defined(CONFIG_100D)
+    uint32_t dmaFlags = EDMAC_2_BYTES_PER_TRANSFER;
+#elif defined(CONFIG_6D)
+    uint32_t dmaFlags = EDMAC_4_BYTES_PER_TRANSFER;
+#else
+    uint32_t dmaFlags = EDMAC_8_BYTES_PER_TRANSFER;
+#endif
+    struct edmac_info dst_edmac_info = { .xb = w, .yb = h-1 };
+    SetEDmac(raw_write_chan, dst, &dst_edmac_info, dmaFlags);
+    StartEDmac(raw_write_chan, 0);
+}
+
 void edmac_raw_slurp(void* dst, int w, int h)
 {
     raw_slurp_pending_dst = 0;      /* a new arm replaces any deferred one */

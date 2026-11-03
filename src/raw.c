@@ -28,6 +28,7 @@
 #include "menu.h"
 #include "config.h"
 #include "edmac-memcpy.h"
+#include "patch.h"
 #include "imgconv.h"
 #include "console.h"
 #include "fps.h"
@@ -682,8 +683,25 @@ static void raw_lv_free_buffer()
 int old_RAW_LV_BUFFER_ALLOC_SIZE;
 #endif
 
+#ifdef CONFIG_EOSM2
+static volatile int isr_arm_suspend;
+static void raw_lv_isr_reprime();
+#endif
 /* requires raw_sem */
+static void raw_lv_realloc_buffer_work();
 static void raw_lv_realloc_buffer()
+{
+#ifdef CONFIG_EOSM2
+    isr_arm_suspend++;
+    raw_lv_realloc_buffer_work();
+    raw_lv_isr_reprime();
+    isr_arm_suspend--;
+#else
+    raw_lv_realloc_buffer_work();
+#endif
+}
+
+static void raw_lv_realloc_buffer_work()
 {
     int width, height;
     int ok = raw_lv_get_resolution(&width, &height);
@@ -1989,11 +2007,101 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 /* see raw_lv_vsync; zeroed by writing magic 0 over USB if needed */
 struct {
     uint32_t magic, arms, busy, min_dt, max_dt, last_arm, last_busy_arm, last_busy_ptr, last_busy_dst;
-    uint32_t waited, wait_timeouts, max_wait_us;   /* deferred arms (started from the completion CBR), unused, unused */
+    uint32_t waited, wait_timeouts, max_wait_us;   /* arms from the readout-done interrupt (M2), unused, unused */
 } raw_slurp_stats = { 0x534C5253 /* "SRLS" */ };
+
+#ifdef CONFIG_EOSM2
+/* ---------------------------------------------------------------------------
+ * Interrupt arming (EOS M2). ML's vsync runs when Canon's Evf task handles the readout-done
+ * event, which the readout-done interrupt (RAM 0x11BA0, INT-D9h) only queues. In Canon's
+ * recording path (crop_rec "1080p 3x3 (Canon AF)") that task is sometimes late: the slurp
+ * was then armed after the next frame had started, missed its first ~7 rows and shifted it
+ * (pink frames). Here the next transfer is started from the interrupt itself, and the buffer
+ * that just completed is recorded for the recorder (raw_lv_get_completed), so mlv_lite does
+ * not have to guess which buffer holds which frame.
+ * --------------------------------------------------------------------------- */
+#define READOUT_DONE_ISR_ADDR   0x11BA0
+#define READOUT_DONE_ISR_INSN   0xE92D4038      /* push {r3, r4, r5, lr} */
+static volatile int isr_arm_on = 0;
+static int isr_arm_hook_err = -1;
+static volatile int isr_arm_suspend = 0;        /* while the raw buffer is reallocated */
+static void * volatile cap_buf[2];              /* recorder's two buffers (cacheable), or 0 */
+static volatile int cap_next = 0;
+static void * volatile isr_cur_dst = 0;         /* buffer the running transfer fills */
+static void * volatile cap_done_buf = 0;        /* buffer holding the last completed frame */
+static volatile uint32_t cap_seq = 0;           /* completed frames */
+
+static void raw_lv_isr_reprime()
+{
+    isr_cur_dst = 0;
+}
+
+int raw_lv_isr_capture_active()
+{
+    return isr_arm_on && isr_arm_hook_err == 0 && RAW_SLURP;
+}
+
+void raw_lv_set_capture_buffers(void * a, void * b)
+{
+    int old = cli();
+    cap_buf[0] = a ? CACHEABLE(a) : 0;
+    cap_buf[1] = b ? CACHEABLE(b) : 0;
+    cap_next = 0;
+    sei(old);
+}
+
+/* returns the completed-frame counter; *buf = the buffer holding that frame */
+uint32_t raw_lv_get_completed(void ** buf)
+{
+    int old = cli();
+    uint32_t seq = cap_seq;
+    if (buf) *buf = cap_done_buf;
+    sei(old);
+    return seq;
+}
+
+static void raw_isr_arm_next();
+static void FAST readout_done_isr_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    /* wait until the vsync has done the full setup once (isr_cur_dst) */
+    if (!isr_arm_on || isr_arm_suspend || !lv_raw_enabled || !RAW_SLURP || !isr_cur_dst) return;
+    raw_isr_arm_next();
+}
+
+/* weak: the "minimal" builds link raw.o without patch.c */
+extern int patch_hook_function(uintptr_t addr, uint32_t orig_instr, patch_hook_function_cbr logging_function, const char * description) __attribute__((weak));
+
+void raw_lv_isr_arm(int on)
+{
+    if (on && isr_arm_hook_err == -1 && patch_hook_function)
+    {
+        isr_arm_hook_err = patch_hook_function(READOUT_DONE_ISR_ADDR, READOUT_DONE_ISR_INSN,
+            &readout_done_isr_hook, "raw: arm slurp from readout-done interrupt");
+    }
+    isr_arm_on = on && isr_arm_hook_err == 0;
+    isr_cur_dst = 0;        /* the next vsync does the full setup again */
+}
+#else
+static const int isr_arm_on = 0;
+#endif
 
 void FAST raw_lv_vsync()
 {
+#ifdef CONFIG_EOSM2
+    int isr_prime = 0;
+    if (raw_lv_isr_capture_active())
+    {
+        if (isr_cur_dst)
+        {
+            /* armed from the readout-done interrupt; nothing to do at the (late) vsync */
+            redirected_raw_buffer = 0;
+            return;
+        }
+        /* first frame: full setup from here (callbacks, connection), then the interrupt takes over */
+        isr_prime = 1;
+    }
+#endif
+
     /* where should we save the raw data? */
     if (!RAW_SLURP)
     {
@@ -2059,6 +2167,9 @@ void FAST raw_lv_vsync()
                      * (crop_rec's HEAD timers for the Canon 3x3 preset). */
                 }
                 edmac_raw_slurp(CACHEABLE(buf), pitch, height);
+#ifdef CONFIG_EOSM2
+                if (isr_prime) isr_cur_dst = CACHEABLE(buf);
+#endif
             }
         }
     }
@@ -2066,6 +2177,68 @@ void FAST raw_lv_vsync()
     /* overriding the buffer is only valid for one frame */
     redirected_raw_buffer = 0;
 }
+
+#ifdef CONFIG_EOSM2
+static void raw_isr_arm_next()
+{
+    extern uint32_t raw_write_chan __attribute__((weak));
+    extern uint32_t edmac_get_base(uint32_t channel) __attribute__((weak));
+    if (!&raw_write_chan || !edmac_get_base) return;
+    uint32_t base = edmac_get_base(raw_write_chan);
+
+    /* the frame normally completes with the readout; give its last bytes a moment */
+    uint32_t t0 = GET_DIGIC_TIMER();
+    while ((MEM(base) & 1) && ((GET_DIGIC_TIMER() - t0) & 0xFFFFF) < 300) { }
+    if (MEM(base) & 1) raw_slurp_stats.busy++;
+
+    /* the frame that just finished */
+    if (isr_cur_dst)
+    {
+        cap_done_buf = isr_cur_dst;
+        cap_seq++;
+    }
+
+    void * dst;
+    if (cap_buf[0] && cap_buf[1])
+    {
+        dst = cap_buf[cap_next];
+        cap_next ^= 1;
+    }
+    else
+    {
+        dst = raw_get_default_lv_buffer();
+    }
+    if (!dst) { isr_cur_dst = 0; return; }
+
+    EngDrvOut(RAW_TYPE_REGISTER, lv_raw_type);
+    if (lv_raw_gain)
+    {
+        EngDrvOut(RAW_TYPE_REGISTER, 0x12);
+        EngDrvOut(SHAD_GAIN_REGISTER, lv_raw_gain);
+    }
+
+    int width, height;
+    if (!raw_lv_get_resolution(&width, &height)) { isr_cur_dst = 0; return; }
+    int pitch = width * raw_info.bits_per_pixel / 8;
+    if (dst == raw_get_default_lv_buffer() && raw_lv_buffer_size < pitch * height) { isr_cur_dst = 0; return; }
+
+    uint32_t now = GET_DIGIC_TIMER();
+    uint32_t dt = (now - raw_slurp_stats.last_arm) & 0xFFFFF;
+    raw_slurp_stats.last_arm = now;
+    raw_slurp_stats.arms++;
+    if (raw_slurp_stats.arms > 1)
+    {
+        if (dt < raw_slurp_stats.min_dt || !raw_slurp_stats.min_dt) raw_slurp_stats.min_dt = dt;
+        if (dt > raw_slurp_stats.max_dt) raw_slurp_stats.max_dt = dt;
+    }
+    raw_slurp_stats.waited++;               /* = armed from the interrupt */
+
+    extern void edmac_raw_slurp_restart(void* dst, int w, int h) __attribute__((weak));
+    if (!edmac_raw_slurp_restart) { isr_cur_dst = 0; return; }
+    edmac_raw_slurp_restart(dst, pitch, height);
+    isr_cur_dst = dst;
+}
+#endif
 
 /* integer gain used to fix the image darkening caused by lv_raw_gain */
 /* this gain must not (!) change the raw data */
@@ -2411,6 +2584,9 @@ static void raw_lv_disable()
 {
     ASSERT(!lv_raw_gain);
     lv_raw_enabled = 0;
+#ifdef CONFIG_EOSM2
+    isr_cur_dst = 0;        /* re-prime from the vsync when enabled again */
+#endif
     raw_info.buffer = 0;
 
 #ifdef RAW_HAVE_SAVE_RAW

@@ -355,6 +355,15 @@ static GUARDED_BY(settings_sem) struct memSuite * shoot_mem_suite = 0;  /* memor
 static GUARDED_BY(settings_sem) struct memSuite * srm_mem_suite = 0;
 
 static GUARDED_BY(settings_sem) void * fullsize_buffers[2];         /* original image, before cropping, double-buffered */
+/* raw.c (EOS M2): slurp armed from the readout-done interrupt; it alternates between our two
+ * buffers itself and reports which one holds the last completed frame */
+extern WEAK_FUNC(ret_0) int raw_lv_isr_capture_active();
+extern WEAK_FUNC(ret_0) void raw_lv_set_capture_buffers(void * a, void * b);
+extern WEAK_FUNC(ret_0) uint32_t raw_lv_get_completed(void ** buf);
+static int isr_buffers_registered = 0;
+static uint32_t isr_last_seq = 0;
+static int isr_missed_frames = 0;
+
 static GUARDED_BY(LiveViewTask) int fullsize_buffer_pos = 0;        /* which of the full size buffers (double buffering) is currently in use */
 
 /* Semaphore for protecting frame slots and the queue, for card spanning where
@@ -1564,6 +1573,14 @@ void free_buffers()
     configured_pre_recording_settings = 0;
     total_slot_count = 0;
     valid_slot_count = 0;
+
+    /* interrupt arming (raw.c): stop using our buffers, let the transfer in flight finish */
+    if (isr_buffers_registered)
+    {
+        raw_lv_set_capture_buffers(0, 0);
+        isr_buffers_registered = 0;
+        if (lv) wait_lv_frames(2);
+    }
 
     /* this buffer is allocated from one of the suites -> nothing to do */
     fullsize_buffers[0] = 0;
@@ -3080,9 +3097,43 @@ unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
     /* panning window is updated when recording, but also when not recording */
     panning_update();
 
-    if (!RAW_IS_RECORDING) return 0;
+    if (!RAW_IS_RECORDING)
+    {
+        if (isr_buffers_registered)
+        {
+            raw_lv_set_capture_buffers(0, 0);
+            isr_buffers_registered = 0;
+        }
+        return 0;
+    }
     if (!raw_lv_settings_still_valid()) { raw_recording_state = RAW_FINISHING; return 0; }
     if (buffer_full) return 0;
+
+    if (raw_lv_isr_capture_active())
+    {
+        /* the interrupt chose the buffers: process whichever one completed last */
+        void * done = 0;
+        if (!isr_buffers_registered)
+        {
+            raw_lv_set_capture_buffers(fullsize_buffers[0], fullsize_buffers[1]);
+            isr_buffers_registered = 1;
+            isr_last_seq = raw_lv_get_completed(0);
+            isr_missed_frames = 0;
+            return 0;
+        }
+        uint32_t seq = raw_lv_get_completed(&done);
+        if (seq == isr_last_seq || !done) return 0;         /* no new frame yet */
+        if (seq - isr_last_seq > 1)
+        {
+            isr_missed_frames += seq - isr_last_seq - 1;
+            printf("LiveView task late: %d frame(s) not recorded (total %d)\n", seq - isr_last_seq - 1, isr_missed_frames);
+        }
+        isr_last_seq = seq;
+        int pos = (CACHEABLE(done) == CACHEABLE(fullsize_buffers[1])) ? 1 : 0;
+        if (CACHEABLE(done) != CACHEABLE(fullsize_buffers[pos])) return 0;  /* not ours (recording start) */
+        process_frame(pos);
+        return 0;
+    }
     
     /* double-buffering */
     raw_lv_redirect_edmac(fullsize_buffers[fullsize_buffer_pos % 2]);
