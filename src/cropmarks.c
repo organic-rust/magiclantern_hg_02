@@ -23,6 +23,7 @@ static int crop_dirty = 0; // redraw cropmarks after some time (unit: 0.1s)
 
 static int cropmarks_x = -1;
 static int cropmarks_y = -1;
+static int cropmarks_full_frame = 0;    /* see set_movie_cropmarks */
 
 void crop_set_dirty(int value)
 {
@@ -564,8 +565,6 @@ static void FAST default_movie_cropmarks()
 /* the recorded area covers the whole LiveView image (e.g. EOS M2 1080p 3x3, 3:2): no border
  * lines at the screen edges, and semi-transparent black outside it, which the info bars pick
  * up as their background (TOPBAR_BGCOLOR / BOTTOMBAR_BGCOLOR) */
-static int cropmarks_full_frame = 0;
-
 void set_movie_cropmarks(int x, int y, int w, int h)
 {
     int tol_x = (os.x_max - os.x0) / 100 + 2;
