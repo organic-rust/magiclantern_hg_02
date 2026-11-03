@@ -752,9 +752,10 @@ static void FAST path_exit_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     int mode = regs[5];
     path_seen = mode;
     path_count++;
-    if (RECORDING) path_seen_rec = mode; else path_seen_idle = mode;
-    /* only with crop_rec presets off: they rewire the Digital zoom path themselves */
-    if (path_override >= 0 && !RECORDING && crop_presets && CROP_PRESET_MENU == CROP_PRESET_OFF)
+    if (RECORDING) path_seen_rec = mode; else if (path_in[0] == 1) path_seen_idle = mode;
+    /* only with crop_rec presets off (they rewire the Digital zoom path themselves), and only
+     * for standby LiveView (S:1): forcing it in other states (S:12, Canon 26) froze LiveView */
+    if (path_override >= 0 && !RECORDING && path_in[0] == 1 && crop_presets && CROP_PRESET_MENU == CROP_PRESET_OFF)
     {
         regs[5] = path_override;
     }
