@@ -2064,7 +2064,7 @@ uint32_t raw_lv_get_completed(void ** buf)
 static void raw_isr_arm_next();
 
 /* diagnostics: every call of the handler (time, args, channel state, armed?), read over USB */
-struct raw_isr_log_entry { uint32_t t, r0, r1, busy, ptr, armed; };
+struct raw_isr_log_entry { uint32_t t, r0, r1, busy, ptr, armed; };   /* r1: last completion time (DIGIC timer) */
 struct { uint32_t magic, w; struct raw_isr_log_entry e[64]; } raw_isr_log = { 0x474C5349 /* "ISLG" */ };
 static volatile int raw_isr_armed = 0;      /* set by raw_isr_arm_next when it started a transfer */
 
@@ -2073,7 +2073,8 @@ static void FAST readout_done_isr_hook(uint32_t* regs, uint32_t* stack, uint32_t
     extern uint32_t raw_write_chan __attribute__((weak));
     extern uint32_t edmac_get_base(uint32_t channel) __attribute__((weak));
     struct raw_isr_log_entry * e = &raw_isr_log.e[raw_isr_log.w % 64];
-    e->t = GET_DIGIC_TIMER(); e->r0 = regs[0]; e->r1 = regs[1];
+    extern volatile uint32_t raw_slurp_cbr_time __attribute__((weak));
+    e->t = GET_DIGIC_TIMER(); e->r0 = regs[0]; e->r1 = &raw_slurp_cbr_time ? raw_slurp_cbr_time : 0;
     if (&raw_write_chan && edmac_get_base)
     {
         uint32_t base = edmac_get_base(raw_write_chan);

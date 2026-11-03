@@ -372,9 +372,11 @@ void edmac_raw_slurp_defer(void* dst, int w, int h)
 /* EOS M2 (raw.c): called when the slurp transfer completes / aborts, to start the next one */
 void (*raw_slurp_complete_hook)(int aborted) = 0;
 volatile uint32_t raw_slurp_cbr_count = 0;
+volatile uint32_t raw_slurp_cbr_time = 0;       /* DIGIC timer at the last completion */
 
 static void edmac_slurp_complete_cbr (void* ctx)
 {
+    if ((int) ctx == 0) raw_slurp_cbr_time = GET_DIGIC_TIMER();
     raw_slurp_cbr_count++;
     if (raw_slurp_complete_hook) raw_slurp_complete_hook((int) ctx);
     uint32_t dst = raw_slurp_pending_dst;
