@@ -1989,7 +1989,7 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 /* see raw_lv_vsync; zeroed by writing magic 0 over USB if needed */
 struct {
     uint32_t magic, arms, busy, min_dt, max_dt, last_arm, last_busy_arm, last_busy_ptr, last_busy_dst;
-    uint32_t waited, wait_timeouts, max_wait_us;
+    uint32_t waited, wait_timeouts, max_wait_us;   /* aborted, still busy after abort, unused */
 } raw_slurp_stats = { 0x534C5253 /* "SRLS" */ };
 
 void FAST raw_lv_vsync()
@@ -2047,20 +2047,19 @@ void FAST raw_lv_vsync()
                     raw_slurp_stats.last_busy_ptr = MEM(edmac_get_base(raw_write_chan) + 8);
                     raw_slurp_stats.last_busy_dst = (uint32_t) buf;
 
-                    /* The hook sometimes runs ~8 ms early (EOS M2, Canon's recording capture info
-                     * in standby: 33 ms after the previous one at 23.976 fps) while the last rows
-                     * of the previous frame are still arriving. Re-arming then sends that tail to
-                     * the start of the next buffer and shifts the whole next frame (pink frames,
-                     * last rows of the previous one unwritten). Let the transfer finish first. */
-                    uint32_t t0 = GET_DIGIC_TIMER();
-                    uint32_t waited = 0;
-                    while ((MEM(edmac_get_base(raw_write_chan)) & 1) && waited < 5000)
+                    /* EOS M2, Canon's recording capture info in standby: now and then a frame
+                     * arrives ~7 rows short (transfer stuck at 99.4%; it never finished within
+                     * 5 ms, so waiting doesn't help and stalls Evf). Left running, it swallows the
+                     * first rows of the next frame and shifts everything after them (pink frames).
+                     * Abort it: the short frame keeps a few stale bottom rows, the next one starts
+                     * at row 0. */
+                    extern void AbortEDmac(unsigned int channel) __attribute__((weak));
+                    if (AbortEDmac)
                     {
-                        waited = (GET_DIGIC_TIMER() - t0) & 0xFFFFF;
+                        AbortEDmac(raw_write_chan);
+                        raw_slurp_stats.waited++;       /* = aborted */
+                        if (MEM(edmac_get_base(raw_write_chan)) & 1) raw_slurp_stats.wait_timeouts++;   /* still busy */
                     }
-                    raw_slurp_stats.waited++;
-                    if (waited >= 5000) raw_slurp_stats.wait_timeouts++;
-                    if (waited > raw_slurp_stats.max_wait_us) raw_slurp_stats.max_wait_us = waited;
                 }
                 edmac_raw_slurp(CACHEABLE(buf), pitch, height);
             }
