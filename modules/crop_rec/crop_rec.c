@@ -3589,42 +3589,49 @@ static MENU_UPDATE_FUNC(saf_pd_update)
         saf_res_count, saf_res_fpc, saf_drop_patched, saf_drop_err);
 }
 
+/* SAF info as text (ML/SAF.TXT, and the PTP mailbox slot "saf") */
+static int saf_format(char * buf, int size)
+{
+    int len = 0;
+    static const char * names[SAF_NSNAP] = { "normal", "Digital zoom / mcm", "no crop, Canon mode 1..3 (H.264 1080p rec?)" };
+    for (int c = 0; c < SAF_NSNAP; c++)
+    {
+        struct saf_snap * sn = &saf_snap[c];
+        len += snprintf(buf + len, size - len, "== %s: %s\n", names[c],
+            sn->valid ? "" : "(not seen yet)");
+        if (!sn->valid) continue;
+        len += snprintf(buf + len, size - len, "setups %d, mode %d -> %d\n", sn->count, sn->mode_in, sn->mode_out);
+        len += snprintf(buf + len, size - len, "selector in: kind %d lvmode %d zoom %x r3 %d s0 %d s1 %d\n",
+            sn->sel_in[0], sn->sel_in[1], sn->sel_in[2], sn->sel_in[3], sn->sel_in[4], sn->sel_in[5]);
+        len += snprintf(buf + len, size - len, "param:");
+        for (int i = 0; i < 12; i++) len += snprintf(buf + len, size - len, " %d", sn->param[i]);
+        len += snprintf(buf + len, size - len, "\nreadout start %x end %x\n", sn->rd_start, sn->rd_end);
+        for (int k = 0; k < 2; k++)
+        {
+            len += snprintf(buf + len, size - len, "geo%d @%x:", k, sn->geo_ptr[k]);
+            for (int i = 0; i < 12; i++) len += snprintf(buf + len, size - len, " %d", sn->geo[k][i]);
+            len += snprintf(buf + len, size - len, "\n");
+        }
+        if (sn->late_ok)
+        {
+            len += snprintf(buf + len, size - len, "0.5 s later: readout start %x end %x, picker y %d b %d @%x\npicker words:",
+                sn->rd_start2, sn->rd_end2, sn->pick_y, sn->pick_b, sn->pick_ptr);
+            for (int i = 0; i < 24; i++) len += snprintf(buf + len, size - len, " %04x", sn->pick_words[i]);
+            len += snprintf(buf + len, size - len, "\ngrid row (mode %d):", sn->mode_out);
+            for (int i = 0; i < 8; i++) len += snprintf(buf + len, size - len, " %d", sn->grid[i]);
+            len += snprintf(buf + len, size - len, "\n");
+        }
+    }
+    return len;
+}
+
 static void saf_save_file(void)
 {
     FILE * f = FIO_CreateFile("ML/SAF.TXT");
     if (!f) { NotifyBox(2000, "Cannot create ML/SAF.TXT"); return; }
     char * buf = malloc(4096);
     if (!buf) { FIO_CloseFile(f); return; }
-    int len = 0;
-    static const char * names[SAF_NSNAP] = { "normal", "Digital zoom / mcm", "no crop, Canon mode 1..3 (H.264 1080p rec?)" };
-    for (int c = 0; c < SAF_NSNAP; c++)
-    {
-        struct saf_snap * sn = &saf_snap[c];
-        len += snprintf(buf + len, 4096 - len, "== %s: %s\n", names[c],
-            sn->valid ? "" : "(not seen yet)");
-        if (!sn->valid) continue;
-        len += snprintf(buf + len, 4096 - len, "setups %d, mode %d -> %d\n", sn->count, sn->mode_in, sn->mode_out);
-        len += snprintf(buf + len, 4096 - len, "selector in: kind %d lvmode %d zoom %x r3 %d s0 %d s1 %d\n",
-            sn->sel_in[0], sn->sel_in[1], sn->sel_in[2], sn->sel_in[3], sn->sel_in[4], sn->sel_in[5]);
-        len += snprintf(buf + len, 4096 - len, "param:");
-        for (int i = 0; i < 12; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->param[i]);
-        len += snprintf(buf + len, 4096 - len, "\nreadout start %x end %x\n", sn->rd_start, sn->rd_end);
-        for (int k = 0; k < 2; k++)
-        {
-            len += snprintf(buf + len, 4096 - len, "geo%d @%x:", k, sn->geo_ptr[k]);
-            for (int i = 0; i < 12; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->geo[k][i]);
-            len += snprintf(buf + len, 4096 - len, "\n");
-        }
-        if (sn->late_ok)
-        {
-            len += snprintf(buf + len, 4096 - len, "0.5 s later: readout start %x end %x, picker y %d b %d @%x\npicker words:",
-                sn->rd_start2, sn->rd_end2, sn->pick_y, sn->pick_b, sn->pick_ptr);
-            for (int i = 0; i < 24; i++) len += snprintf(buf + len, 4096 - len, " %04x", sn->pick_words[i]);
-            len += snprintf(buf + len, 4096 - len, "\ngrid row (mode %d):", sn->mode_out);
-            for (int i = 0; i < 8; i++) len += snprintf(buf + len, 4096 - len, " %d", sn->grid[i]);
-            len += snprintf(buf + len, 4096 - len, "\n");
-        }
-    }
+    int len = saf_format(buf, 4096);
     FIO_WriteFile(f, buf, len);
     FIO_CloseFile(f);
     free(buf);
@@ -4524,6 +4531,75 @@ static void set_zoom(int zoom)
 
 
 /* when closing ML menu, check whether we need to refresh the LiveView */
+/* ---------------------------------------------------------------------------
+ * PTP mailbox (src/ptp.c, CONFIG_PTP): lets a host read the traces over USB
+ * (contrib/ptp/ptp_ml.py crlog / saf) without saving files from the menu,
+ * also while LiveView is frozen.
+ *   slot 5 "crtrace": struct cr_ptp below: the raw DebugMsg ring (the host
+ *                     formats it, reading the format strings from camera memory)
+ *   slot 6 "saf":     SAF info text, refreshed every second
+ * cmd: written by the host, handled here: 1 start Freeze trace, 2 pause
+ * capture, 3 resume capture, 4 save SAF.TXT on the card.
+ * --------------------------------------------------------------------------- */
+extern WEAK_FUNC(ret_0) void ptp_mailbox_set(int slot, const char *name, void *ptr, volatile uint32_t *len);
+
+#define CR_PTP_MAGIC 0x31505243     /* "CRP1" */
+static struct cr_ptp
+{
+    uint32_t magic;
+    uint32_t entry_size, entries;           /* ring geometry */
+    struct dmlog_entry * ring;
+    volatile int * w;                       /* total entries written (ring index = w % entries) */
+    uint32_t * cls_count;                   /* 256 counters */
+    volatile int * paused, * frz, * frz_caught, * gmt;
+    volatile uint32_t cmd, cmd_done;        /* host command / last one handled */
+    uint32_t digic_timer_now;               /* updated each poll, to relate timestamps */
+} cr_ptp;
+static volatile uint32_t cr_ptp_len = sizeof(cr_ptp);
+static char saf_text[4096];
+static volatile uint32_t saf_text_len = 0;
+
+static void cr_ptp_init(void)
+{
+    cr_ptp.magic = CR_PTP_MAGIC;
+    cr_ptp.entry_size = sizeof(struct dmlog_entry);
+    cr_ptp.entries = DMLOG_N;
+    cr_ptp.ring = dmlog;
+    cr_ptp.w = &dmlog_w;
+    cr_ptp.cls_count = dm_cls_count;
+    cr_ptp.paused = &dmlog_paused;
+    cr_ptp.frz = &frz_trace;
+    cr_ptp.frz_caught = &frz_caught;
+    cr_ptp.gmt = &gmt_trace;
+    ptp_mailbox_set(5, "crtrace", &cr_ptp, &cr_ptp_len);
+    ptp_mailbox_set(6, "saf", saf_text, &saf_text_len);
+}
+
+static void cr_ptp_poll(void)
+{
+    cr_ptp.digic_timer_now = GET_DIGIC_TIMER();
+
+    static int t_saf = 0;
+    int now = get_ms_clock();
+    if (now - t_saf >= 1000)
+    {
+        t_saf = now;
+        saf_text_len = saf_format(saf_text, sizeof(saf_text));
+    }
+
+    uint32_t cmd = cr_ptp.cmd;
+    if (!cmd) return;
+    cr_ptp.cmd = 0;
+    switch (cmd)
+    {
+        case 1: if (!frz_trace) frz_trace_select(0, 1); break;
+        case 2: dmlog_paused = 1; break;
+        case 3: dmlog_paused = 0; break;
+        case 4: saf_save_file(); break;
+    }
+    cr_ptp.cmd_done = cmd;
+}
+
 static unsigned int crop_rec_polling_cbr(unsigned int unused)
 {
     /* also check at startup */
@@ -4534,6 +4610,7 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     frz_trace_poll();
     saf_snap_poll();
     lvs_poll();
+    cr_ptp_poll();
 
     int menu_shown = gui_menu_shown();
     if (lv && menu_shown)
@@ -4822,6 +4899,8 @@ static unsigned int crop_rec_init()
      * something re-triggered them (e.g. pressing MENU twice). Do it once here; the
      * polling CBR refreshes LiveView at startup so the mode is applied cleanly. */
     update_patch();
+
+    if (is_EOSM2) cr_ptp_init();
 
     return 0;
 }

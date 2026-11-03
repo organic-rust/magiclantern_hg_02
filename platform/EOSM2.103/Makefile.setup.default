@@ -5,3 +5,8 @@ ML_AF_PATTERNS_OBJ = n
 
 ML_SRC_EXTRA_OBJS = \
 	reloc.o \
+
+# PTP over USB: CHDK-style memory access plus ML's file / directory / mailbox
+# extensions (src/ptp-chdk.c), for debugging without the card (scripts/ptp_ml.py)
+CONFIG_PTP          = y
+CONFIG_PTP_CHDK     = y
