@@ -2801,13 +2801,24 @@ if (set_25fps == 0x1)
  * as in mcm) so the events behind ML's vsync come after the last line. With Canon's recording
  * timing, now and then a frame was still ~7 rows short at the hook and the slurp shifted the
  * next frame (pink frames). Canon's values are kept for the menu. */
-static int canon3x3_timers = 1;                 /* 0 Canon, 1 crop_rec (mcm values) */
+/* mcm reads lines 4..0x4A6 and fires HEAD3 at 0x4A7, one line after the readout. Canon's 3x3
+ * window ends at 0x4A7 itself, so the frame-end event needs to be later than mcm's value. */
+static int canon3x3_timers = 2;                 /* 0 Canon, 1 0x4A7 (mcm), 2 +8 lines, 3 +16 lines */
 static volatile uint32_t canon3x3_seen[4];      /* Canon's 713C, 7150, 6014, 6008 */
+static volatile uint32_t canon3x3_used = 0;
 static inline uint32_t reg_override_canon3x3_eosm2(uint32_t reg, uint32_t old_val)
 {
+    static const int head3_extra[] = { 0, 0, 8, 16 };
     switch (reg)
     {
-        case 0xC0F0713c: canon3x3_seen[0] = old_val; return canon3x3_timers ? 0x4a7 + reg_713c : 0;
+        case 0xC0F0713c:
+            if (canon3x3_seen[0] != old_val)
+                dmlog_add(DM_MARKER, 0, "*** ML-SPY 3x3 HEAD3 Canon %x -> %x (6804 %x)", old_val,
+                    canon3x3_timers ? 0x4a7 + head3_extra[canon3x3_timers] + reg_713c : old_val, shamem_read(0xC0F06804), 0, 0);
+            canon3x3_seen[0] = old_val;
+            if (!canon3x3_timers) return 0;
+            canon3x3_used = 0x4a7 + head3_extra[canon3x3_timers] + reg_713c;
+            return canon3x3_used;
         case 0xC0F07150: canon3x3_seen[1] = old_val; return canon3x3_timers ? 0x430 + reg_7150 : 0;
         case 0xC0F06014: canon3x3_seen[2] = old_val; return 0;
         case 0xC0F06008: canon3x3_seen[3] = old_val; return 0;
@@ -3693,7 +3704,7 @@ static MENU_SELECT_FUNC(lvs_auto_toggle)
 
 static MENU_UPDATE_FUNC(canon3x3_timers_update)
 {
-    MENU_SET_RINFO("Canon %x %x", canon3x3_seen[0], canon3x3_seen[1]);
+    MENU_SET_RINFO("Canon %x, used %x", canon3x3_seen[0], canon3x3_used);
     MENU_SET_WARNING(MENU_WARN_INFO, "Canon HEAD3 %x HEAD4 %x, timer B %x A %x. crop_rec: 4a7 / 430. Restart LiveView.",
         canon3x3_seen[0], canon3x3_seen[1], canon3x3_seen[2], canon3x3_seen[3]);
 }
@@ -4641,8 +4652,8 @@ static struct menu_entry crop_rec_menu[] =
     {
         .name       = "3x3 frame timers",
         .priv       = &canon3x3_timers,
-        .max        = 1,
-        .choices    = CHOICES("Canon", "crop_rec (mcm)"),
+        .max        = 3,
+        .choices    = CHOICES("Canon", "0x4A7 (mcm)", "+8 lines", "+16 lines"),
         .update     = canon3x3_timers_update,
         .help       = "1080p 3x3 (Canon AF) preset: frame-end timers HEAD3 / HEAD4. crop_rec's\n"
                       "values (as in mcm) put ML's frame hook after the last line. Restart LiveView.\n",
