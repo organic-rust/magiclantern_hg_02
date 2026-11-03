@@ -618,7 +618,14 @@ static int raw_lv_get_resolution(int* width, int* height)
 #if defined(CONFIG_EOSM) || defined(CONFIG_EOSM2)
     /* EOS M exception */
     /* http://www.magiclantern.fm/forum/index.php?topic=16608.msg176023#msg176023 */
-    if (lv_dispsize == 1 && !video_mode_crop && !RECORDING_H264)
+    if (lv_dispsize == 1 && !video_mode_crop && !RECORDING_H264
+    #ifdef CONFIG_EOSM2
+        /* M2: standby reports its real 728-line window; a taller window is a real readout
+         * (Canon's 3x3 capture info in standby, crop_rec's 800C=2 without zoom): keep it.
+         * Clamped, the slurp recorded only the top 727 lines (694 after skips). */
+        && *height <= 800
+    #endif
+    )
     {
         *height = 727;
     }
