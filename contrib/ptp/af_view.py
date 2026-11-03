@@ -12,6 +12,10 @@ and spread. --all prints every frame instead of state changes and every 10th.
 Reading it (normal LiveView, M2): when in focus the good areas agree within a
 few hundred and sit near 0; a consistent offset across areas means real
 defocus, and AF then drives the lens until it returns to ~0.
+
+"Response" is the check that matters: when the lens is driven, real phase data
+changes with it (normal LiveView: about +1.5 defocus per lens-drive unit,
+correlation ~0.5); noise doesn't (mcm SAF mode 4: 0.0 and 0.0).
 """
 import argparse
 import collections
@@ -71,6 +75,34 @@ def main():
         spreads.sort()
         print(f"\nagreement between good areas (median absolute deviation, frames with >= 3 good areas,"
               f" not focusing): median {spreads[len(spreads) // 2]}, p90 {spreads[int(len(spreads) * .9)]}")
+    n, slope, corr = response(rows)
+    if slope is None:
+        print(f"response to lens movement: not enough lens moves ({n})")
+    else:
+        print(f"response to lens movement ({n} moves): {slope:+.2f} defocus per drive unit, correlation {corr:+.2f}"
+              "  (normal LiveView reference: about +1.5, +0.5)")
+
+
+def response(rows, step=6):
+    """slope and correlation of good-area defocus change vs lens drive change,
+    over `step` frames, when the lens moved and the AF frame state stayed the same"""
+    pts = []
+    for a, b in zip(rows, rows[step:]):
+        if a["waku_st"] != b["waku_st"]:
+            continue
+        la, lb = s16(int(a["pd_lens_pos"])), s16(int(b["pd_lens_pos"]))
+        if abs(lb - la) < 50 or (la == 0) != (lb == 0):     # drive value resets to 0 between AF runs
+            continue
+        ga = [int(a[f"d{k}"]) for k in range(10) if good(int(a[f"r{k}"]))]
+        gb = [int(b[f"d{k}"]) for k in range(10) if good(int(b[f"r{k}"]))]
+        if ga and gb:
+            pts.append((lb - la, statistics.median(gb) - statistics.median(ga)))
+    if len(pts) < 3:
+        return len(pts), None, None
+    mx = statistics.mean(p[0] for p in pts); my = statistics.mean(p[1] for p in pts)
+    sxy = sum((x - mx) * (y - my) for x, y in pts)
+    sxx = sum((x - mx) ** 2 for x, _ in pts); syy = sum((y - my) ** 2 for _, y in pts)
+    return len(pts), sxy / sxx, (sxy / (sxx * syy) ** .5 if syy else 0.0)
 
 
 if __name__ == "__main__":
