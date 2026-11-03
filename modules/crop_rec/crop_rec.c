@@ -2797,6 +2797,24 @@ if (set_25fps == 0x1)
     return reg_override_bits(reg, old_val);
 }
 
+/* 1080p 3x3 (Canon AF): Canon's own 3x3 readout, but crop_rec's frame-end timers (HEAD3 / HEAD4,
+ * as in mcm) so the events behind ML's vsync come after the last line. With Canon's recording
+ * timing, now and then a frame was still ~7 rows short at the hook and the slurp shifted the
+ * next frame (pink frames). Canon's values are kept for the menu. */
+static int canon3x3_timers = 1;                 /* 0 Canon, 1 crop_rec (mcm values) */
+static volatile uint32_t canon3x3_seen[4];      /* Canon's 713C, 7150, 6014, 6008 */
+static inline uint32_t reg_override_canon3x3_eosm2(uint32_t reg, uint32_t old_val)
+{
+    switch (reg)
+    {
+        case 0xC0F0713c: canon3x3_seen[0] = old_val; return canon3x3_timers ? 0x4a7 + reg_713c : 0;
+        case 0xC0F07150: canon3x3_seen[1] = old_val; return canon3x3_timers ? 0x430 + reg_7150 : 0;
+        case 0xC0F06014: canon3x3_seen[2] = old_val; return 0;
+        case 0xC0F06008: canon3x3_seen[3] = old_val; return 0;
+    }
+    return reg_override_bits(reg, old_val);
+}
+
 static inline uint32_t reg_override_anamorphic_rewired_eosm2(uint32_t reg, uint32_t old_val)
 {
 /* gets rid of the black border to the right. Connected to mlv_lite which takes over these regs while recording */
@@ -3026,6 +3044,7 @@ static void * get_engio_reg_override_func()
         (crop_preset == CROP_PRESET_mcm_mv1080_EOSM2) ? reg_override_mcm_mv1080_eosm2        :
         (crop_preset == CROP_PRESET_anamorphic_rewired_EOSM2) ? reg_override_anamorphic_rewired_eosm2       :
         (crop_preset == CROP_PRESET_3x1_mv720_50fps_EOSM2) ? reg_override_3x1_mv720_50fps_eosm2        : 
+        (crop_preset == CROP_PRESET_3x3_canon_EOSM2) ? reg_override_canon3x3_eosm2        : 
         // (crop_preset == CROP_PRESET_3x3_1X_EOSM)    ? reg_override_mv1080_mv720p  :
                                                   0                       ;
     return reg_override_func;
@@ -3083,6 +3102,7 @@ static void FAST engio_write_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 }
 
 static int patch_active = 0;
+static int engio_only_active = 0;   /* Canon 3x3 preset: only the timer hook */
 
 static void update_patch()
 {
@@ -3099,12 +3119,22 @@ static void update_patch()
             if (ENGIO_WRITE) unpatch_memory(ENGIO_WRITE);
             patch_active = 0;
         }
+        if (!engio_only_active && ENGIO_WRITE)
+        {
+            patch_hook_function(ENGIO_WRITE, MEM_ENGIO_WRITE, engio_write_hook, "crop_rec: Canon 3x3 frame timers");
+            engio_only_active = 1;
+        }
         if (video_mode_crop) movie_crop_hack_disable();
     }
     else if (CROP_PRESET_MENU && is_movie_mode())
     {
         /* update preset */
         crop_preset = CROP_PRESET_MENU;
+        if (engio_only_active)
+        {
+            unpatch_memory(ENGIO_WRITE);
+            engio_only_active = 0;
+        }
 
         /* install our hooks, if we haven't already do so */
         if (!patch_active)
@@ -3130,6 +3160,12 @@ static void update_patch()
                 unpatch_memory(ENGIO_WRITE);
             }
             patch_active = 0;
+            crop_preset = 0;
+        }
+        if (engio_only_active)
+        {
+            unpatch_memory(ENGIO_WRITE);
+            engio_only_active = 0;
             crop_preset = 0;
         }
     }
@@ -3653,6 +3689,13 @@ static MENU_UPDATE_FUNC(lvs_update)
 static MENU_SELECT_FUNC(lvs_auto_toggle)
 {
     lvs_auto = !lvs_auto;
+}
+
+static MENU_UPDATE_FUNC(canon3x3_timers_update)
+{
+    MENU_SET_RINFO("Canon %x %x", canon3x3_seen[0], canon3x3_seen[1]);
+    MENU_SET_WARNING(MENU_WARN_INFO, "Canon HEAD3 %x HEAD4 %x, timer B %x A %x. crop_rec: 4a7 / 430. Restart LiveView.",
+        canon3x3_seen[0], canon3x3_seen[1], canon3x3_seen[2], canon3x3_seen[3]);
 }
 
 static MENU_UPDATE_FUNC(lvci_menu_update)
@@ -4594,6 +4637,15 @@ static struct menu_entry crop_rec_menu[] =
         .update     = defm_menu_update,
         .help       = "mcm: override skip phase v for the defect map and phase-detect setup\n"
                       "(-1 = Canon: 10 in mcm, 0 in Canon's own 3x3). Restart LiveView.\n",
+    },
+    {
+        .name       = "3x3 frame timers",
+        .priv       = &canon3x3_timers,
+        .max        = 1,
+        .choices    = CHOICES("Canon", "crop_rec (mcm)"),
+        .update     = canon3x3_timers_update,
+        .help       = "1080p 3x3 (Canon AF) preset: frame-end timers HEAD3 / HEAD4. crop_rec's\n"
+                      "values (as in mcm) put ML's frame hook after the last line. Restart LiveView.\n",
     },
     {
         .name       = "LV mode (3x3 test)",

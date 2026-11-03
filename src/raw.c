@@ -2053,18 +2053,12 @@ void FAST raw_lv_vsync()
                      * first rows of the next frame and shifts everything after them (pink frames).
                      * Abort it: the short frame keeps a few stale bottom rows, the next one starts
                      * at row 0. */
-                    extern void edmac_raw_slurp_defer(void* dst, int w, int h) __attribute__((weak));
-                    if (edmac_raw_slurp_defer)
-                    {
-                        /* the late rows of the previous frame arrive after this hook: start the
-                         * next transfer from the completion callback, once they're in */
-                        edmac_raw_slurp_defer(CACHEABLE(buf), pitch, height);
-                        raw_slurp_stats.waited++;       /* = deferred */
-                        goto slurp_done;
-                    }
+                    /* tried: waiting (never finished, stalled Evf), aborting (the late rows then
+                     * shift the next frame), starting from the completion callback (Canon never
+                     * called it: slurp stalled). Counted only; the fix is the frame timing
+                     * (crop_rec's HEAD timers for the Canon 3x3 preset). */
                 }
                 edmac_raw_slurp(CACHEABLE(buf), pitch, height);
-            slurp_done:;
             }
         }
     }
