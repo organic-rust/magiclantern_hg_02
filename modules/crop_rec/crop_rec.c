@@ -2572,17 +2572,19 @@ static inline uint32_t reg_override_1x3_eosm(uint32_t reg, uint32_t old_val)
  * 0x40019 (line 4, column unit 0x19). Canon's own 3x3 (H.264 1080p recording), where phase detect
  * gives coherent results, uses 0x10013 (line 1, column 0x13). This option moves the window start
  * (and end, so the size stays the same) to test whether phase detect reads the wrong lines. */
-static int mcm_rd_shift = 0;    /* 0 = Canon, 1 = lines -3, 2 = lines -3 and columns -6, 3 = columns -6 */
+static int mcm_rd_shift = 0;    /* 0 = Canon, 1 = lines -3, 2 = lines -3 and columns -6, 3 = columns -6,
+                                 * 4 = lines -2, 5 = lines +2 (even: keeps the Bayer phase, no pink tint) */
+static const int mcm_rd_dy[] = { 0, -3, -3, 0, -2, 2 };
+static const int mcm_rd_dx[] = { 0,  0, -6, -6, 0, 0 };
 static inline uint32_t reg_override_mcm_mv1080_eosm2_base(uint32_t reg, uint32_t old_val);
 static inline uint32_t reg_override_mcm_mv1080_eosm2(uint32_t reg, uint32_t old_val)
 {
     uint32_t v = reg_override_mcm_mv1080_eosm2_base(reg, old_val);
     if (mcm_rd_shift && (reg == 0xC0F06800 || reg == 0xC0F06804))
     {
-        uint32_t dy = (mcm_rd_shift == 1 || mcm_rd_shift == 2) ? 3 : 0;
-        uint32_t dx = (mcm_rd_shift == 2 || mcm_rd_shift == 3) ? 6 : 0;
+        int dy = mcm_rd_dy[mcm_rd_shift], dx = mcm_rd_dx[mcm_rd_shift];
         if (!v) v = old_val;
-        v -= (dy << 16) + dx;
+        v += (uint32_t)(dy * 65536 + dx);
     }
     return v;
 }
@@ -4499,10 +4501,10 @@ static struct menu_entry crop_rec_menu[] =
     {
         .name       = "Readout start (mcm)",
         .priv       = &mcm_rd_shift,
-        .max        = 3,
-        .choices    = CHOICES("Canon (line 4)", "line 1", "line 1, col -6", "col -6"),
-        .help       = "Moves the mcm raw window start to match Canon's own 3x3 recording\n"
-                      "(0x10013). Size stays the same. Restart LiveView.\n",
+        .max        = 5,
+        .choices    = CHOICES("Canon (line 4)", "line 1", "line 1, col -6", "col -6", "line 2", "line 6"),
+        .help       = "Moves the mcm raw window start (size stays). Odd line shifts flip the\n"
+                      "colour pattern (pink LiveView); line 2 / 6 keep it. Restart LiveView.\n",
     },
     {
         .name       = "CMOS[4] (focus px?)",
