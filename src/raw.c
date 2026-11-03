@@ -86,6 +86,10 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 #if defined(CONFIG_EDMAC_RAW_SLURP) && defined(CONFIG_EDMAC_RAW_SLURP_OPTIONAL)
 #define RAW_HAVE_SAVE_RAW
 static CONFIG_INT("raw.slurp", raw_slurp_menu, 1);
+/* 0: use Canon's LV raw buffer when it is large enough (default), 1: always allocate our own.
+ * EOS M2, Canon's 3x3 capture info in standby: pink bands at the bottom of some frames, as if
+ * Canon also writes into its raw buffer in that mode */
+static CONFIG_INT("raw.own_buffer", raw_own_buffer, 0);
 static int raw_slurp_active = 1;    /* latched in raw_lv_enable */
 #define RAW_SLURP (raw_slurp_active)
 #elif defined(CONFIG_EDMAC_RAW_SLURP)
@@ -690,7 +694,17 @@ static void raw_lv_realloc_buffer()
     }
 
     int required_size = width * height * 14/8;
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+    if (raw_own_buffer && raw_lv_buffer && raw_lv_buffer == raw_allocated_lv_buffer
+        && old_RAW_LV_BUFFER_ALLOC_SIZE == (raw_info.width * raw_info.height * 14 / 8 + 0x1000))
+    {
+        allocating_new_buffer_is_needed = 0;
+        return;
+    }
+    if (!raw_own_buffer && DEFAULT_RAW_BUFFER_SIZE >= required_size)
+#else
     if (DEFAULT_RAW_BUFFER_SIZE >= required_size)
+#endif
     {
         /* no need for a larger buffer */
         if (raw_lv_buffer != (void *) DEFAULT_RAW_BUFFER)
@@ -722,7 +736,11 @@ static void raw_lv_realloc_buffer()
         return;
     }
 
-    if (raw_lv_buffer == (void *) DEFAULT_RAW_BUFFER)
+    if (raw_lv_buffer == (void *) DEFAULT_RAW_BUFFER
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+        && !raw_own_buffer
+#endif
+       )
     {
         if (raw_lv_buffer_size >= required_size)
         {
@@ -752,7 +770,11 @@ static void raw_lv_realloc_buffer()
     allocating_new_buffer_is_needed = 1; // flag to tell mlv_lite to free its buffers while we allocate a new buufer
 #endif 
 
-    if (DEFAULT_RAW_BUFFER_SIZE >= required_size)
+    if (DEFAULT_RAW_BUFFER_SIZE >= required_size
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+        && !raw_own_buffer
+#endif
+       )
     {
         if (raw_lv_buffer && raw_lv_buffer != (void *) DEFAULT_RAW_BUFFER)
         {
@@ -760,6 +782,14 @@ static void raw_lv_realloc_buffer()
             return;
         }
     }
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+    if (raw_own_buffer && raw_allocated_lv_buffer)
+    {
+        /* switching size: drop the old one first */
+        free(raw_allocated_lv_buffer);
+        raw_allocated_lv_buffer = 0;
+    }
+#endif
 
 #ifdef CONFIG_ALLOCATE_RAW_LV_BUFFER
     raw_allocated_lv_buffer = fio_malloc(RAW_LV_BUFFER_ALLOC_SIZE);
@@ -2687,6 +2717,14 @@ static struct menu_entry debug_menus[] = {
         .update = raw_slurp_update,
         .help = "How LiveView raw frames are captured. EDMAC slurp: ML copies them into",
         .help2 = "its own buffer (default). lv_save_raw: Canon's own raw path and buffer.",
+    },
+    {
+        .name = "Raw buffer",
+        .priv = &raw_own_buffer,
+        .max  = 1,
+        .choices = CHOICES("Canon's (default)", "ML's own"),
+        .help = "Where the slurp writes LV raw frames: Canon's LV raw buffer, or one ML allocates",
+        .help2 = "(test for Canon writing into its buffer). Applies when the raw stream restarts.",
     },
 #endif
 #ifdef RAW_DEBUG_TYPE
