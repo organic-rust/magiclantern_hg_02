@@ -894,7 +894,9 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         return;
     }
     memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
-    if (RECORDING || !mode || off != 4 || size != 52) return;
+    /* not during H.264 recording (Canon's own 3x3), but yes while recording raw: RECORDING
+     * includes raw, and skipping there let a half-press drop the sensor to 5x3 (stopped the MLV) */
+    if (RECORDING_H264 || !mode || off != 4 || size != 52) return;
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
@@ -4976,9 +4978,20 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
             {
                 info_led_on();
                 gui_uilock(UILOCK_EVERYTHING);
-                int old_zoom = lv_dispsize;
-                set_zoom(lv_dispsize == 1 ? 5 : 1);
-                set_zoom(old_zoom);
+                if (CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2 && lv_dispsize == 1)
+                {
+                    /* full LiveView stop / start: Canon then applies the movie frame rate
+                     * for the recording capture info (the zoom toggle kept 29.97) */
+                    PauseLiveView();
+                    msleep(200);
+                    ResumeLiveView();
+                }
+                else
+                {
+                    int old_zoom = lv_dispsize;
+                    set_zoom(lv_dispsize == 1 ? 5 : 1);
+                    set_zoom(old_zoom);
+                }
                 gui_uilock(UILOCK_NONE);
                 info_led_off();
             }
