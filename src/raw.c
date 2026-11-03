@@ -692,9 +692,10 @@ static void raw_lv_realloc_buffer_work();
 static void raw_lv_realloc_buffer()
 {
 #ifdef CONFIG_EOSM2
+    void * old_buf = raw_lv_buffer;
     isr_arm_suspend++;
     raw_lv_realloc_buffer_work();
-    raw_lv_isr_reprime();
+    if (raw_lv_buffer != old_buf) raw_lv_isr_reprime();
     isr_arm_suspend--;
 #else
     raw_lv_realloc_buffer_work();
@@ -2007,7 +2008,7 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 /* see raw_lv_vsync; zeroed by writing magic 0 over USB if needed */
 struct {
     uint32_t magic, arms, busy, min_dt, max_dt, last_arm, last_busy_arm, last_busy_ptr, last_busy_dst;
-    uint32_t waited, wait_timeouts, max_wait_us;   /* arms from the readout-done interrupt (M2), unused, unused */
+    uint32_t waited, wait_timeouts, max_wait_us;   /* M2: arms from the completion callback, chain restarts, unused */
 } raw_slurp_stats = { 0x534C5253 /* "SRLS" */ };
 
 #ifdef CONFIG_EOSM2
@@ -2080,13 +2081,21 @@ static void FAST readout_done_isr_hook(uint32_t* regs, uint32_t* stack, uint32_t
     }
     raw_isr_armed = 0;
 
-    /* wait until the vsync has done the full setup once (isr_cur_dst) */
+    /* arming moved to the slurp's completion callback (an arm from here was cancelled every
+     * other frame, likely by Canon's completion handling of the previous transfer) */
+    e->armed = raw_isr_armed;
+    raw_isr_log.w++;
+}
+
+/* the slurp transfer completed: start the next one right away (before the next frame) */
+static void raw_slurp_completed(int how)
+{
+    if (how != 0) return;                       /* abort / pop: not a completed frame */
     if (isr_arm_on && !isr_arm_suspend && lv_raw_enabled && RAW_SLURP && isr_cur_dst)
     {
         raw_isr_arm_next();
+        raw_isr_log.e[(raw_isr_log.w + 63) % 64].armed |= raw_isr_armed << 1;
     }
-    e->armed = raw_isr_armed;
-    raw_isr_log.w++;
 }
 
 /* weak: the "minimal" builds link raw.o without patch.c */
@@ -2101,6 +2110,8 @@ void raw_lv_isr_arm(int on)
     }
     isr_arm_on = on && isr_arm_hook_err == 0;
     isr_cur_dst = 0;        /* the next vsync does the full setup again */
+    extern void (*raw_slurp_complete_hook)(int) __attribute__((weak));
+    if (&raw_slurp_complete_hook) raw_slurp_complete_hook = isr_arm_on ? raw_slurp_completed : 0;
 }
 #else
 static const int isr_arm_on = 0;
@@ -2112,12 +2123,26 @@ void FAST raw_lv_vsync()
     int isr_prime = 0;
     if (raw_lv_isr_capture_active())
     {
+        extern volatile uint32_t raw_slurp_cbr_count __attribute__((weak));
+        static uint32_t last_cbr = 0;
+        static int stale = 0;
+        uint32_t cbr = &raw_slurp_cbr_count ? raw_slurp_cbr_count : 0;
         if (isr_cur_dst)
         {
-            /* armed from the readout-done interrupt; nothing to do at the (late) vsync */
-            redirected_raw_buffer = 0;
-            return;
+            /* armed from the completion callback; the vsync only watches the chain */
+            stale = (cbr == last_cbr) ? stale + 1 : 0;
+            last_cbr = cbr;
+            if (stale < 3)
+            {
+                redirected_raw_buffer = 0;
+                return;
+            }
+            /* no completion for 3 frames (a transfer that never finished): set up again */
+            stale = 0;
+            isr_cur_dst = 0;
+            raw_slurp_stats.wait_timeouts++;
         }
+        last_cbr = cbr;
         /* first frame: full setup from here (callbacks, connection), then the interrupt takes over */
         isr_prime = 1;
     }
@@ -2207,9 +2232,6 @@ static void raw_isr_arm_next()
     if (!&raw_write_chan || !edmac_get_base) return;
     uint32_t base = edmac_get_base(raw_write_chan);
 
-    /* the frame normally completes with the readout; give its last bytes a moment */
-    uint32_t t0 = GET_DIGIC_TIMER();
-    while ((MEM(base) & 1) && ((GET_DIGIC_TIMER() - t0) & 0xFFFFF) < 300) { }
     if (MEM(base) & 1) raw_slurp_stats.busy++;
 
     /* the frame that just finished */

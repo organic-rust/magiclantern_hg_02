@@ -369,8 +369,14 @@ void edmac_raw_slurp_defer(void* dst, int w, int h)
     raw_slurp_pending_dst = (uint32_t) dst;
 }
 
+/* EOS M2 (raw.c): called when the slurp transfer completes / aborts, to start the next one */
+void (*raw_slurp_complete_hook)(int aborted) = 0;
+volatile uint32_t raw_slurp_cbr_count = 0;
+
 static void edmac_slurp_complete_cbr (void* ctx)
 {
+    raw_slurp_cbr_count++;
+    if (raw_slurp_complete_hook) raw_slurp_complete_hook((int) ctx);
     uint32_t dst = raw_slurp_pending_dst;
     if (dst)
     {
@@ -407,8 +413,8 @@ void edmac_raw_slurp(void* dst, int w, int h)
 
     /* @g3gg0: this callback does get called */
     RegisterEDmacCompleteCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
-    RegisterEDmacAbortCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
-    RegisterEDmacPopCBR(raw_write_chan, &edmac_slurp_complete_cbr, 0);
+    RegisterEDmacAbortCBR(raw_write_chan, &edmac_slurp_complete_cbr, (void*) 1);
+    RegisterEDmacPopCBR(raw_write_chan, &edmac_slurp_complete_cbr, (void*) 2);
     
     /* connect the selected channels to 0 so the raw data from sensor is passed to write channel */
     ConnectWriteEDmac(raw_write_chan, 0);
