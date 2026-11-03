@@ -1092,7 +1092,12 @@ int raw_update_params_work()
         raw_capture_info.binning_x  = 3; raw_capture_info.skipping_x = 0;
 #ifdef CONFIG_5D3
         raw_capture_info.skipping_y = 0; raw_capture_info.binning_y  = mv720 ? 5 : 3;
-#elif defined(CONFIG_EOSM) || defined(CONFIG_EOSM2)
+#elif defined(CONFIG_EOSM2)
+        /* standby is 5x3 and H.264 recording 3x3, but the readout decides: a window taller
+         * than the 728-line standby one is 3x3 (Canon's 3x3 capture info in standby) */
+        int tall = ((shamem_read(0xC0F06804) >> 16) - (shamem_read(0xC0F06800) >> 16)) > 800;
+        raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = (mv720 || !(RECORDING_H264 || tall)) ? 4 : 2;
+#elif defined(CONFIG_EOSM)
         raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = (mv720 || !RECORDING_H264) ? 4 : 2;
 #else
         raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = mv720 ? 4 : 2;
