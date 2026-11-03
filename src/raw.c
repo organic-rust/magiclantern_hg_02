@@ -1986,6 +1986,11 @@ void FAST raw_lv_redirect_edmac(void* ptr)
 
 #ifdef CONFIG_EDMAC_RAW_SLURP
 
+/* see raw_lv_vsync; zeroed by writing magic 0 over USB if needed */
+struct {
+    uint32_t magic, arms, busy, min_dt, max_dt, last_arm, last_busy_arm, last_busy_ptr, last_busy_dst;
+} raw_slurp_stats = { 0x534C5253 /* "SRLS" */ };
+
 void FAST raw_lv_vsync()
 {
     /* where should we save the raw data? */
@@ -2019,6 +2024,28 @@ void FAST raw_lv_vsync()
             int pitch = width * raw_info.bits_per_pixel / 8;
             if (raw_lv_buffer_size >= pitch * height)
             {
+                /* diagnostics (EOS M2 Canon 3x3 preset: rare frames with displaced data):
+                 * was the write channel still busy when we re-armed it, and how close are
+                 * consecutive arms? read over USB (raw_slurp_stats in magiclantern.sym) */
+                /* weak: the "minimal" builds link raw.o without edmac.c / edmac-memcpy.c */
+                extern uint32_t raw_write_chan __attribute__((weak));
+                extern uint32_t edmac_get_base(uint32_t channel) __attribute__((weak));
+                uint32_t now = GET_DIGIC_TIMER();
+                uint32_t dt = (now - raw_slurp_stats.last_arm) & 0xFFFFF;
+                raw_slurp_stats.last_arm = now;
+                raw_slurp_stats.arms++;
+                if (raw_slurp_stats.arms > 1)
+                {
+                    if (dt < raw_slurp_stats.min_dt || !raw_slurp_stats.min_dt) raw_slurp_stats.min_dt = dt;
+                    if (dt > raw_slurp_stats.max_dt) raw_slurp_stats.max_dt = dt;
+                }
+                if (&raw_write_chan && edmac_get_base && (MEM(edmac_get_base(raw_write_chan)) & 1))
+                {
+                    raw_slurp_stats.busy++;
+                    raw_slurp_stats.last_busy_arm = raw_slurp_stats.arms;
+                    raw_slurp_stats.last_busy_ptr = MEM(edmac_get_base(raw_write_chan) + 8);
+                    raw_slurp_stats.last_busy_dst = (uint32_t) buf;
+                }
                 edmac_raw_slurp(CACHEABLE(buf), pitch, height);
             }
         }
