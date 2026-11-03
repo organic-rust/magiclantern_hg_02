@@ -51,6 +51,7 @@ enum crop_preset {
     CROP_PRESET_mcm_mv1080_EOSM2,
     CROP_PRESET_anamorphic_rewired_EOSM2,
     CROP_PRESET_3x1_mv720_50fps_EOSM2,
+    CROP_PRESET_3x3_canon_EOSM2,
     NUM_CROP_PRESETS
 };
 
@@ -106,6 +107,7 @@ static enum crop_preset crop_presets_eosm2[] = {
     CROP_PRESET_OFF,
     CROP_PRESET_mcm_mv1080_EOSM2,
     CROP_PRESET_anamorphic_rewired_EOSM2,
+    CROP_PRESET_3x3_canon_EOSM2,        /* index 3: was the hidden 720p entry, so saved indices keep their meaning */
     CROP_PRESET_3x1_mv720_50fps_EOSM2,
 };
 
@@ -113,6 +115,7 @@ static const char * crop_choices_eosm2[] = {
     "OFF",
     "mv1080p_rewired",
     "4K anamorphic rewired",
+    "1080p 3x3 (Canon AF)",
   //  "mv720p 1736x694 50fps",
   //  "1x3 binning",
 };
@@ -123,7 +126,8 @@ static const char crop_choices_help_eosm2[] =
 static const char crop_choices_help2_eosm2[] =
     "\n"
     "enables Movie crop mode\n"
-    "1x3 binning modes(anamorphic) rewired 2.35:1\n";
+    "1x3 binning modes(anamorphic) rewired 2.35:1\n"
+    "Canon's own 3x3 (H.264 1080p) readout in standby: 1736x1158, phase-detect AF\n";
  //   "mv720p 50fps 16:9\n"
 
 
@@ -828,6 +832,7 @@ static void FAST defm_sel_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
  * blocks instead (all, or only the LV mode field). Applies from the next state change: restart
  * LiveView after changing it.
  * --------------------------------------------------------------------------- */
+static int is_1080p();
 #define LVCI_SET_ADDR       0x103A0
 #define LVCI_SET_INSN       0xE92D4010      /* push {r4, lr} */
 #define LVCI_CALLER_LO      0xFF187400
@@ -871,7 +876,12 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     const uint8_t * src = (const uint8_t *) regs[2];
     if (!src || (uint32_t) src >= 0x60000000 || size == 0 || size > 1024) return;
     lvci.calls++; lvci.last_caller = caller; lvci.last_off = off; lvci.last_size = size;
-    if (video_mode_crop || (crop_presets && CROP_PRESET_MENU != CROP_PRESET_OFF)) return;
+    if (video_mode_crop || !crop_presets) return;
+    int canon3x3 = (CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2);
+    if (CROP_PRESET_MENU != CROP_PRESET_OFF && !canon3x3) return;
+    int mode = canon3x3 ? 1 : lvci_override;
+    /* the 1080p recording record: only for 1080p movie LiveView (not photo mode, not 720p) */
+    if (!is_movie_mode() || !is_1080p()) return;
     struct lvci_entry * e = lvci_find(off, size, 1);
     if (!e) return;
     /* Canon writes the new state's blocks just before RECORDING changes, so classify each burst by
@@ -884,13 +894,13 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         return;
     }
     memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
-    if (RECORDING || !lvci_override || off != 4 || size != 52) return;
+    if (RECORDING || !mode || off != 4 || size != 52) return;
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
-    if (e->rec_ok && lvci_override == 1)
+    if (e->rec_ok && mode == 1)
         memcpy(lvci_tmp, lvci.pool + e->rec_pos, size);
-    else if (lvci_override == 1)
+    else if (mode == 1)
     {
         ((int32_t *) lvci_tmp)[1] = 4;      /* block +0x08: 2 standby, 4 recording */
         ((int32_t *) lvci_tmp)[2] = 0;      /* block +0x0C: LV mode 1 / 0 */
@@ -3075,7 +3085,21 @@ static int patch_active = 0;
 static void update_patch()
 {
 
-    if (CROP_PRESET_MENU && is_movie_mode())
+    if (CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2 && is_movie_mode())
+    {
+        /* Canon's own 3x3: only the capture-info substitution (lvci_hook), no register
+         * hooks, no Movie crop mode, raw geometry from the raw backend */
+        crop_preset = CROP_PRESET_MENU;
+        if (patch_active)
+        {
+            unpatch_memory(CMOS_WRITE);
+            unpatch_memory(ADTG_WRITE);
+            if (ENGIO_WRITE) unpatch_memory(ENGIO_WRITE);
+            patch_active = 0;
+        }
+        if (video_mode_crop) movie_crop_hack_disable();
+    }
+    else if (CROP_PRESET_MENU && is_movie_mode())
     {
         /* update preset */
         crop_preset = CROP_PRESET_MENU;
