@@ -884,19 +884,23 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         return;
     }
     memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
-    if (RECORDING) return;
-    if (lvci_override == 1 && e->rec_ok)
+    if (RECORDING || !lvci_override || off != 4 || size != 52) return;
+    /* only the 52-byte record differs between the states: substitute it in standby, with the
+     * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
+    memcpy(lvci_tmp, src, size);
+    if (e->rec_ok && lvci_override == 1)
+        memcpy(lvci_tmp, lvci.pool + e->rec_pos, size);
+    else if (lvci_override == 1)
     {
-        regs[2] = (uint32_t)(lvci.pool + e->rec_pos);
-        e->n_used++;
+        ((int32_t *) lvci_tmp)[1] = 4;      /* block +0x08: 2 standby, 4 recording */
+        ((int32_t *) lvci_tmp)[2] = 0;      /* block +0x0C: LV mode 1 / 0 */
+        ((int32_t *) lvci_tmp)[3] = 0;      /* block +0x10: 1 / 0 */
+        ((int32_t *) lvci_tmp)[5] = 1;      /* block +0x18: 0 / 1 */
     }
-    else if (lvci_override == 2 && off == 4 && size == 52 && e->rec_ok && size <= sizeof(lvci_tmp))
-    {
-        memcpy(lvci_tmp, src, size);
-        memcpy(lvci_tmp + 8, lvci.pool + e->rec_pos + 8, 4);    /* block +0x0C: LV mode */
-        regs[2] = (uint32_t) lvci_tmp;
-        e->n_used++;
-    }
+    else
+        ((int32_t *) lvci_tmp)[2] = 0;      /* LV mode field only (crashed: Evf event queue full) */
+    regs[2] = (uint32_t) lvci_tmp;
+    e->n_used++;
 }
 
 #define SAF_START_ADDR      0xFF1020E4
@@ -3634,11 +3638,8 @@ static MENU_UPDATE_FUNC(lvci_menu_update)
     int mode_rec = rec ? *(int32_t *)(lvci.pool + e->rec_pos + 8) : -1;
     int mode_stb = stb ? *(int32_t *)(lvci.pool + e->stb_pos + 8) : -1;
     MENU_SET_RINFO("LV mode stb %d rec %d", mode_stb, mode_rec);
-    if (!rec)
-        MENU_SET_WARNING(MENU_WARN_ADVICE, "Record a few s of H.264 first (crop preset OFF) to capture Canon's 3x3 blocks.");
-    else
-        MENU_SET_WARNING(MENU_WARN_INFO, "%d blocks, substituted %d. Crop preset OFF, standby only. Restart LiveView.",
-            lvci.n_entries, e ? e->n_used : 0);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%s values. Substituted %d. Crop preset OFF, standby only. Restart LiveView.",
+        rec ? "Captured recording" : "Built-in 1080p recording", e ? e->n_used : 0);
 }
 
 static MENU_UPDATE_FUNC(path_menu_update)
