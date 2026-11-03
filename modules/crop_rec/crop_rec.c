@@ -733,6 +733,10 @@ static void saf_modify_param(uint32_t * param, int is_setup)
  * switches to a 3x3 path. Overriding the result in standby may give Canon's own 3x3 readout
  * (with Canon's own phase-detect setup) without crop_rec register rewiring.
  * --------------------------------------------------------------------------- */
+/* route: 0 = Canon (recording route, path 6), else force this path (11 = standby route); writable
+ * over USB at mailbox 'timers' + 108; applied at the next PATH_Select (LiveView restart) */
+static struct { uint32_t magic, n, writes; uint32_t reg[12], val[12]; volatile uint32_t route; } c3_timers = { 0x524D5443 /* "CTMR" */, 12 };
+static volatile uint32_t c3_timers_len = sizeof(c3_timers);
 #define PATH_SEL_ENTRY_ADDR 0x193DC
 #define PATH_SEL_ENTRY_INSN 0xE92D4030      /* push {r4, r5, lr} */
 #define PATH_SEL_EXIT_ADDR  0x197B0
@@ -763,6 +767,13 @@ static void FAST path_exit_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     if (path_override >= 0 && !RECORDING && path_in[0] == 1 && crop_presets && CROP_PRESET_MENU == CROP_PRESET_OFF)
     {
         regs[5] = path_override;
+    }
+    /* 1080p 3x3 (Canon AF): Canon picks its recording route (6, state S:0) for the substituted
+     * capture info; optionally the standby route, to test whether its extra processing is what
+     * starves the raw slurp (short frames) */
+    if (c3_timers.route && !RECORDING_H264 && path_in[0] == 0 && crop_presets && CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2)
+    {
+        regs[5] = c3_timers.route;
     }
     path_used = regs[5];
     dmlog_add(0xFFFF, 0, "*** ML-SPY PATH S:%d Z:%x R:%x DZ:%d", path_in[0], path_in[1], path_in[2], path_in[3], 0);
@@ -2812,8 +2823,6 @@ static volatile uint32_t canon3x3_used = 0;
 /* Canon's timing registers as written in this mode (PTP mailbox slot 3 "timers") */
 static const uint32_t c3_regs[] = { 0xC0F06014, 0xC0F06008, 0xC0F0600C, 0xC0F06010, 0xC0F06824,
     0xC0F0713C, 0xC0F07150, 0xC0F06800, 0xC0F06804, 0xC0F07134, 0xC0F07148, 0xC0F0715C };
-static struct { uint32_t magic, n, writes; uint32_t reg[12], val[12]; } c3_timers = { 0x524D5443 /* "CTMR" */, 12 };
-static volatile uint32_t c3_timers_len = sizeof(c3_timers);
 
 static inline uint32_t reg_override_canon3x3_eosm2(uint32_t reg, uint32_t old_val)
 {
