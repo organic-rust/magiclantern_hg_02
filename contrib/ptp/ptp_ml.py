@@ -15,6 +15,9 @@
                                        crop_rec: start the Freeze trace, pause / resume
                                        capture, write ML/SAF.TXT
   ptp_ml.py saf                        crop_rec's Hybrid AF (SAF) info, as ML/SAF.TXT
+  ptp_ml.py aflog start|stop|clear     crop_rec's AF log (one record per phase-detect result)
+  ptp_ml.py aflog [FILE.csv]           dump it as CSV (--last N); --follow: print new
+                                       records live (Ctrl-C to stop)
   ptp_ml.py lvs [FILE]                 Canon's LV settings block (0xC4868, 0xBF8 bytes),
                                        as crop_rec's "Dump LV settings" (LVS1 header)
   ptp_ml.py lv [SECONDS]               remote LiveView test: on, wait, off
@@ -483,6 +486,102 @@ def cformat(fmt, args, strings):
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# crop_rec AF log (mailbox slot "aflog"): header magic, rec_size, n, ring*, w, enabled;
+# record: struct aflog_rec in crop_rec.c (64 bytes)
+# ---------------------------------------------------------------------------
+PDLOG_MAGIC = 0x314C4641    # "AFL1"
+PDLOG_REC = struct.Struct("<II34sBBBBBBBB2xiHBBI")
+PDLOG_FLAGS = ((1, "crop"), (2, "rec"), (4, "half"), (8, "servo"), (16, "ignored"), (32, "dropped"))
+PDLOG_COLS = (["seq", "t_us", "frame", "saf_mode", "flags", "af_mode", "waku_st", "waku_sub",
+               "iso", "tv", "av", "focus_pos", "focus_dist_cm", "pd_lens_pos", "pd_extra",
+               "valid_areas"] + [f"d{i}" for i in range(10)] + [f"r{i}" for i in range(10)])
+
+
+def pdlog_header(ptp, sym):
+    slots = {name: (ptr, length) for _, name, ptr, length in read_mailbox(ptp, sym)}
+    if "aflog" not in slots:
+        sys.exit("no aflog slot: crop_rec not loaded, or older build")
+    base = slots["aflog"][0]
+    magic, rsize, n, ring, w, enabled = ptp.words(base, 6)
+    if magic != PDLOG_MAGIC or rsize != PDLOG_REC.size:
+        sys.exit("aflog: header mismatch (crop_rec.mo and this script differ)")
+    return base, n, ring, w, enabled
+
+
+def pdlog_rows(raw):
+    for off in range(0, len(raw) - PDLOG_REC.size + 1, PDLOG_REC.size):
+        (t, seq, pkt, mode, flags, afm, st, sub, iso, tv, av, fpos, fdist, ign, preset,
+         frames) = PDLOG_REC.unpack_from(raw, off)
+        d = struct.unpack_from(">10h", pkt, 0)
+        r = pkt[20:30]
+        lens = struct.unpack_from(">H", pkt, 30)[0]
+        extra = struct.unpack_from(">H", pkt, 32)[0]
+        fl = "+".join(name for bit, name in PDLOG_FLAGS if flags & bit) or "-"
+        yield ([seq, t & 0xFFFFF, frames, mode, fl, afm, st, sub, iso, tv, av, fpos, fdist, lens, extra,
+                sum(1 for x in r if x)] + list(d) + list(r))
+
+
+def pdlog_read(ptp, n, ring, start, end):
+    """records start..end-1 (absolute numbers), oldest first, reading only those"""
+    raw = b""
+    i = start
+    while i < end:
+        slot = i % n
+        k = min(end - i, n - slot)
+        raw += ptp.read(ring + slot * PDLOG_REC.size, k * PDLOG_REC.size)
+        i += k
+    return raw
+
+
+def aflog_cmd(ptp, a):
+    import time
+    sub = a.args[0] if a.args else ""
+    if sub in ("start", "stop", "clear"):
+        base, _ = cr_slot(ptp, a.sym)
+        cmd = {"start": 5, "stop": 6, "clear": 7}[sub]
+        ptp.write32(base + CR_CMD, cmd)
+        for _ in range(30):
+            time.sleep(0.1)
+            if ptp.words(base + CR_CMD)[0] == 0:
+                _, n, ring, w, en = pdlog_header(ptp, a.sym)
+                print(f"AF log {'on' if en else 'off'}, {w} records")
+                return
+        print("not handled yet (crop_rec's polling not running?)")
+        return
+    _, n, ring, w, enabled = pdlog_header(ptp, a.sym)
+    if not ring:
+        sys.exit("AF log never started: ptp_ml.py aflog start (or Movie > crop_rec > AF log)")
+    start = max(0, w - n, w - a.last if a.last else 0)
+    out = open(a.args[0], "w") if a.args else sys.stdout
+    out.write(",".join(PDLOG_COLS) + "\n")
+    for row in pdlog_rows(pdlog_read(ptp, n, ring, start, w)):
+        out.write(",".join(map(str, row)) + "\n")
+    if a.args:
+        print(f"saved {w - start} records to {a.args[0]} (AF log {'on' if enabled else 'off'})")
+    if not a.follow:
+        return
+    if a.args:
+        out.close()
+        out = sys.stdout
+    try:
+        while True:
+            time.sleep(0.3)
+            _, n, ring, w2, _ = pdlog_header(ptp, a.sym)
+            if w2 < w:          # cleared
+                w = 0
+            if w2 - w > n:      # fell behind
+                w = w2 - n
+            if w2 > w:
+                for row in pdlog_rows(pdlog_read(ptp, n, ring, w, w2)):
+                    out.write(",".join(map(str, row)) + "\n")
+                out.flush()
+                w = w2
+            ptp.eos_events() if a.lv else None
+    except KeyboardInterrupt:
+        pass
+
+
 def crlog(ptp, sym, last=0):
     base, _ = cr_slot(ptp, sym)
     (magic, esize, n, ring, wptr, clsptr, pausedp, frzp, caughtp, gmtp,
@@ -521,7 +620,8 @@ def main():
     ap.add_argument("cmd", choices=["info", "read", "words", "write", "mailbox", "log", "lv",
                                     "get", "findmlv", "ls", "latest", "console",
                                     "put", "rm", "mkdir", "mv", "install",
-                                    "crlog", "crcmd", "saf", "lvs"])
+                                    "crlog", "crcmd", "saf", "lvs", "aflog"])
+    ap.add_argument("--follow", action="store_true", help="aflog: keep printing new records")
     ap.add_argument("--slot", default="saf", help="mailbox slot for the log command")
     ap.add_argument("--last", type=int, default=0, help="crlog: only the newest N entries")
     ap.add_argument("args", nargs="*")
@@ -587,6 +687,8 @@ def main():
                     break
             else:
                 print("not handled yet (is LiveView / crop_rec's polling running?)")
+        elif a.cmd == "aflog":
+            aflog_cmd(ptp, a)
         elif a.cmd == "saf":
             slots = {name: (ptr, length) for _, name, ptr, length in read_mailbox(ptp, a.sym)}
             if "saf" not in slots:

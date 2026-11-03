@@ -14,6 +14,8 @@ build to the card: the mailbox address comes from platform/EOSM2.103/magiclanter
     ./ptp_ml.py crcmd start        # start crop_rec's Freeze trace
     ./ptp_ml.py crlog FRZ.TXT      # read the trace (also after a LiveView freeze)
     ./ptp_ml.py saf                # Hybrid AF (SAF) info
+    ./ptp_ml.py aflog start        # AF log: one record per phase-detect result
+    ./ptp_ml.py aflog --follow     # print records live as CSV (or aflog AF.csv)
     ./ptp_ml.py lvs LVS_M.BIN      # Canon's LV settings block
     ./ptp_ml.py ls B:/ML/          # card files; get / put / install
     ./ptp_ml.py console            # ML console text

@@ -411,11 +411,87 @@ static volatile int saf_hist_w = 0;
 static volatile int saf_hist_valid[SAF_HIST_N];
 static volatile int saf_hist_jump[SAF_HIST_N];
 
+/* ---------------------------------------------------------------------------
+ * AF log: one record per phase-detect result (SAF_DefocusResult, ~1 per frame) with
+ * the AF / lens / exposure state at that moment, in a ring a host reads over USB
+ * (mailbox slot 7 "pdlog", contrib/ptp/ptp_ml.py pdlog). The packet is copied as
+ * Canon delivered it, before "Phase detect (mcm)" Ignore zeroes the reliabilities.
+ * --------------------------------------------------------------------------- */
+struct aflog_rec {                  /* 64 bytes */
+    uint32_t t;                     /* DIGIC timer (us, 20 bits on DIGIC 5) */
+    uint32_t seq;                   /* result number */
+    uint8_t  pkt[34];               /* 10 x BE s16 defocus, 10 x u8 reliability, BE u16 lens pos, 2 more */
+    uint8_t  saf_mode;              /* SAF mode in use */
+    uint8_t  flags;                 /* 1 crop/mcm, 2 recording, 4 half-shutter, 8 servo, 16 ignored, 32 dropped */
+    uint8_t  af_mode;               /* lv_af_mode */
+    uint8_t  waku_st, waku_sub;     /* Gmt AF frame state */
+    uint8_t  iso, tv, av;           /* lens_info raw values */
+    int32_t  focus_pos;             /* lens_info.focus_pos (ML's step counter) */
+    uint16_t focus_dist;            /* cm */
+    uint8_t  pd_ignore, preset;
+    uint32_t frames;                /* LV frame counter at this result (vsync) */
+};
+#define PDLOG_MAGIC 0x314C4641      /* "AFL1" */
+#define PDLOG_N     2048            /* ~68 s at 30 fps */
+static struct {
+    uint32_t magic, rec_size, n;
+    struct aflog_rec * ring;
+    volatile uint32_t w;            /* records written */
+    volatile uint32_t enabled;
+} pdlog = { PDLOG_MAGIC, sizeof(struct aflog_rec), PDLOG_N, 0, 0, 0 };
+static volatile uint32_t aflog_len = sizeof(pdlog);
+static int aflog_menu = 0;
+
+static void aflog_enable(int on)
+{
+    if (on && !pdlog.ring)
+    {
+        pdlog.ring = malloc(PDLOG_N * sizeof(struct aflog_rec));
+        if (!pdlog.ring) { NotifyBox(2000, "AF log: no memory"); aflog_menu = 0; return; }
+        pdlog.w = 0;
+    }
+    pdlog.enabled = on && pdlog.ring;
+    aflog_menu = pdlog.enabled;
+}
+
+extern int lv_af_mode;
+static volatile uint32_t aflog_frames = 0;
+
+static void FAST aflog_add(const uint8_t * pk)
+{
+    if (!pdlog.enabled) return;
+    struct aflog_rec * r = &pdlog.ring[pdlog.w % PDLOG_N];
+    r->t = GET_DIGIC_TIMER();
+    r->seq = saf_res_count;
+    memcpy(r->pkt, pk, 34);
+    r->saf_mode = saf_used_mode;
+    r->flags = (video_mode_crop ? 1 : 0) | (RECORDING ? 2 : 0) | (get_halfshutter_pressed() ? 4 : 0)
+             | (movie_servo_af ? 8 : 0) | ((saf_pd_ignore == 1 && video_mode_crop) ? 16 : 0)
+             | (saf_drop_patched ? 32 : 0);
+    r->af_mode = lv_af_mode;
+    r->waku_st = r->waku_sub = 0xFF;
+    uint32_t gmt = *(volatile uint32_t *)(0x921F4 + 0x14);
+    if (gmt && gmt < 0x10000000)
+    {
+        uint32_t so = *(volatile uint32_t *)(gmt + 0x18);
+        if (so && so < 0x10000000) r->waku_st = *(volatile uint32_t *)(so + 0x1C);
+        r->waku_sub = *(volatile int *)(gmt + 0x754);
+    }
+    r->iso = lens_info.raw_iso; r->tv = lens_info.raw_shutter; r->av = lens_info.raw_aperture;
+    r->focus_pos = lens_info.focus_pos;
+    r->focus_dist = lens_info.focus_dist;
+    r->pd_ignore = saf_pd_ignore;
+    r->preset = crop_preset;
+    r->frames = aflog_frames;
+    pdlog.w++;
+}
+
 static void FAST saf_result_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     uint8_t * pk = (uint8_t *) regs[0];
     if (!pk || (uint32_t) pk > 0x10000000) return;
     saf_res_count++;
+    aflog_add(pk);
     saf_res_d0 = (int16_t)((pk[0] << 8) | pk[1]);
     saf_res_r0 = pk[20];
     int v = 0;
@@ -718,14 +794,22 @@ static void FAST defm_entry_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         if (defm_h >= 0) regs[0] = defm_h;
         if (defm_v >= 0) regs[1] = defm_v;
     }
-    dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM H %d v %d idx %d -> H %d v %d", defm_h_seen, defm_v_seen, idx, regs[0], regs[1]);
+    /* called every frame: log only changes */
+    static uint32_t last_key = 0xFFFFFFFF;
+    uint32_t key = (defm_h_seen & 0xFF) | ((defm_v_seen & 0xFF) << 8) | ((idx & 0xFF) << 16) | ((regs[0] & 0xF) << 24) | ((regs[1] & 0xF) << 28);
+    if (key != last_key)
+    {
+        last_key = key;
+        dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM H %d v %d idx %d -> H %d v %d", defm_h_seen, defm_v_seen, idx, regs[0], regs[1]);
+    }
 }
 
 static void FAST defm_sel_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
 {
     if (defm_off && video_mode_crop && !RECORDING) regs[4] = 0;
+    if (defm_ptr != regs[4])
+        dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM map %x", regs[4], 0, 0, 0, 0);
     defm_ptr = regs[4];
-    dmlog_add(0xFFFF, 0, "*** ML-SPY DEFM map %x", regs[4], 0, 0, 0, 0);
 }
 
 #define SAF_START_ADDR      0xFF1020E4
@@ -3637,6 +3721,17 @@ static void saf_save_file(void)
     free(buf);
 }
 
+static MENU_SELECT_FUNC(aflog_menu_select)
+{
+    aflog_enable(!pdlog.enabled);
+}
+
+static MENU_UPDATE_FUNC(aflog_menu_update)
+{
+    MENU_SET_VALUE(pdlog.enabled ? "ON" : "OFF");
+    if (pdlog.ring) MENU_SET_RINFO("%d", pdlog.w);
+}
+
 static MENU_SELECT_FUNC(saf_save_select)
 {
     saf_save_file();
@@ -4410,6 +4505,15 @@ static struct menu_entry crop_rec_menu[] =
                       "phase-detect results at all (contrast AF only). Immediate.\n",
     },
     {
+        .name       = "AF log (USB)",
+        .priv       = &aflog_menu,
+        .max        = 1,
+        .select     = aflog_menu_select,
+        .update     = aflog_menu_update,
+        .help       = "Records every phase-detect result with AF / lens state (~68 s ring).\n"
+                      "Read over USB: contrib/ptp/ptp_ml.py aflog (or aflog --follow).\n",
+    },
+    {
         .name       = "Save SAF info",
         .select     = saf_save_select,
         .help       = "Writes ML/SAF.TXT: Hybrid AF setup seen without and with Digital zoom.\n",
@@ -4538,8 +4642,10 @@ static void set_zoom(int zoom)
  *   slot 5 "crtrace": struct cr_ptp below: the raw DebugMsg ring (the host
  *                     formats it, reading the format strings from camera memory)
  *   slot 6 "saf":     SAF info text, refreshed every second
+ *   slot 7 "aflog":   AF log ring (struct aflog_rec per phase-detect result)
  * cmd: written by the host, handled here: 1 start Freeze trace, 2 pause
- * capture, 3 resume capture, 4 save SAF.TXT on the card.
+ * capture, 3 resume capture, 4 save SAF.TXT on the card, 5 AF log on,
+ * 6 AF log off, 7 clear the AF log.
  * --------------------------------------------------------------------------- */
 extern WEAK_FUNC(ret_0) void ptp_mailbox_set(int slot, const char *name, void *ptr, volatile uint32_t *len);
 
@@ -4573,6 +4679,7 @@ static void cr_ptp_init(void)
     cr_ptp.gmt = &gmt_trace;
     ptp_mailbox_set(5, "crtrace", &cr_ptp, &cr_ptp_len);
     ptp_mailbox_set(6, "saf", saf_text, &saf_text_len);
+    ptp_mailbox_set(7, "aflog", &pdlog, &aflog_len);
 }
 
 static void cr_ptp_poll(void)
@@ -4596,6 +4703,9 @@ static void cr_ptp_poll(void)
         case 2: dmlog_paused = 1; break;
         case 3: dmlog_paused = 0; break;
         case 4: saf_save_file(); break;
+        case 5: aflog_enable(1); break;
+        case 6: aflog_enable(0); break;
+        case 7: pdlog.w = 0; break;
     }
     cr_ptp.cmd_done = cmd;
 }
@@ -4927,8 +5037,15 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(mcm_af)
 MODULE_CONFIGS_END()
 
+static unsigned int crop_rec_vsync_cbr(unsigned int unused)
+{
+    aflog_frames++;     /* LV frame counter for the AF log */
+    return 0;
+}
+
 MODULE_CBRS_START()
     MODULE_CBR(CBR_SHOOT_TASK, crop_rec_polling_cbr, 0)
+    MODULE_CBR(CBR_VSYNC, crop_rec_vsync_cbr, 0)
     MODULE_CBR(CBR_RAW_INFO_UPDATE, raw_info_update_cbr, 0)
 MODULE_CBRS_END()
 
