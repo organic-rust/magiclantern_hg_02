@@ -92,6 +92,14 @@ static CONFIG_INT("raw.slurp", raw_slurp_menu, 1);
  * Canon also writes into its raw buffer in that mode */
 static CONFIG_INT("raw.own_buffer", raw_own_buffer, 0);
 static int raw_slurp_active = 1;    /* latched in raw_lv_enable */
+static int lv_raw_enabled_ext();
+/* crop_rec "1080p 3x3 (Canon AF)" (EOS M2): Canon's recording route starves the slurp (3% of
+ * frames lose 7-14 lines mid-frame); Canon's own raw DMA (lv_save_raw) records it cleanly */
+static int raw_force_canon = 0;
+#define RAW_SLURP_WANTED (raw_slurp_menu && !raw_force_canon)
+void raw_lv_force_canon_raw(int on) { raw_force_canon = on; }
+/* 1 if the raw stream has to restart (LiveView stop / start) to use the wanted method */
+int raw_lv_method_restart_needed() { return lv_raw_enabled_ext() && raw_slurp_active != RAW_SLURP_WANTED; }
 #define RAW_SLURP (raw_slurp_active)
 #elif defined(CONFIG_EDMAC_RAW_SLURP)
 #define RAW_SLURP 1
@@ -2597,7 +2605,7 @@ static void raw_lv_enable()
     
 #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
     /* the method can only change while the raw stream is off */
-    raw_slurp_active = raw_slurp_menu;
+    raw_slurp_active = RAW_SLURP_WANTED;
     printf("LV raw: %s\n", raw_slurp_active ? "EDMAC slurp" : "lv_save_raw");
 #endif
 
@@ -2656,6 +2664,8 @@ static void raw_lv_disable()
     if (RAW_SLURP) raw_lv_free_buffer();
 #endif
 }
+
+static int lv_raw_enabled_ext() { return lv_raw_enabled > 0; }
 
 int raw_lv_is_enabled()
 {
@@ -2969,6 +2979,11 @@ PROP_HANDLER(PROP_LV_DISPSIZE)
 #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
 static MENU_UPDATE_FUNC(raw_slurp_update)
 {
+    if (raw_force_canon)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "crop_rec 1080p 3x3 (Canon AF) uses lv_save_raw (Canon) - the slurp loses data there.");
+        return;
+    }
     if (lv_raw_enabled && raw_slurp_menu != raw_slurp_active)
         MENU_SET_WARNING(MENU_WARN_INFO, "Active: %s. Applies when the raw stream restarts (LiveView off/on).",
             raw_slurp_active ? "EDMAC slurp" : "lv_save_raw");

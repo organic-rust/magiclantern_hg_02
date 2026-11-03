@@ -18,6 +18,8 @@ extern WEAK_FUNC(ret_0) unsigned int is_crop_hack_supported();
 extern WEAK_FUNC(ret_0) unsigned int movie_crop_hack_enable();
 extern WEAK_FUNC(ret_0) unsigned int movie_crop_hack_disable();
 extern WEAK_FUNC(ret_0) void raw_lv_isr_arm(int on);     /* raw.c, EOS M2: slurp armed from the readout-done interrupt */
+extern WEAK_FUNC(ret_0) void raw_lv_force_canon_raw(int on);   /* raw.c, EOS M2: use Canon's lv_save_raw */
+extern WEAK_FUNC(ret_0) int raw_lv_method_restart_needed();
 
 #undef CROP_DEBUG
 
@@ -3157,14 +3159,17 @@ static void update_patch()
             patch_hook_function(ENGIO_WRITE, MEM_ENGIO_WRITE, engio_write_hook, "crop_rec: Canon 3x3 frame timers");
             engio_only_active = 1;
         }
-        /* Canon's recording path delays ML's vsync: arm the raw slurp from the interrupt */
-        raw_lv_isr_arm(1);
+        /* Canon's recording route starves ML's raw slurp (frames lose 7-14 lines mid-frame,
+         * ~3%); Canon's own raw DMA records it cleanly (M04-1216: 0 of 757 corrupted) */
+        raw_lv_isr_arm(0);
+        raw_lv_force_canon_raw(1);
         if (video_mode_crop) movie_crop_hack_disable();
     }
     else if (CROP_PRESET_MENU && is_movie_mode())
     {
         /* update preset */
         raw_lv_isr_arm(0);
+        raw_lv_force_canon_raw(0);
         crop_preset = CROP_PRESET_MENU;
         if (engio_only_active)
         {
@@ -3205,6 +3210,7 @@ static void update_patch()
             crop_preset = 0;
         }
         raw_lv_isr_arm(0);
+        raw_lv_force_canon_raw(0);
     }
 
     mcm_af_update();
@@ -5068,12 +5074,14 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
             {
                 info_led_on();
                 gui_uilock(UILOCK_EVERYTHING);
-                if (CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2 && lv_dispsize == 1)
+                if ((CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2 || raw_lv_method_restart_needed()) && lv_dispsize == 1)
                 {
                     /* full LiveView stop / start: Canon then applies the movie frame rate
-                     * for the recording capture info (the zoom toggle kept 29.97) */
+                     * for the recording capture info (the zoom toggle kept 29.97), and the
+                     * raw stream restarts with the method this preset needs (mlv_lite
+                     * releases raw while LiveView is paused) */
                     PauseLiveView();
-                    msleep(200);
+                    msleep(500);
                     ResumeLiveView();
                 }
                 else
