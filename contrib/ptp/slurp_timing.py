@@ -24,7 +24,7 @@ d = lambda x, y: (x - y) % TIMER
 
 p = m.PTP()
 try:
-    p.write32(S("raw_isr_mode_override"), a.mode)
+    p.write32(S("raw_isr_mode_override"), a.mode & 0xFFFFFFFF)
     out = p.remote_lv(True, (1,))
     t = time.time()
     while time.time() - t < 3 + a.seconds:
@@ -60,6 +60,6 @@ try:
     p.remote_lv(False)
 finally:
     try:
-        p.write32(S("raw_isr_mode_override"), -1)
+        p.write32(S("raw_isr_mode_override"), 0xFFFFFFFF)    # -1
     finally:
         p.close()

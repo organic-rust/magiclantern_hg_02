@@ -395,10 +395,13 @@ static void edmac_slurp_complete_cbr (void* ctx)
 
 /* like edmac_raw_slurp, but only programs and starts the channel: for re-arming from an
  * interrupt after edmac_raw_slurp has set up the callbacks and the connection once */
+/* EOS M2: transfer size of the slurp, settable over USB for tests (0 = default below) */
+uint32_t raw_slurp_dma_flags = 0;
+
 void edmac_raw_slurp_restart(void* dst, int w, int h)
 {
 #if defined(CONFIG_650D) || defined(CONFIG_700D) || defined(CONFIG_EOSM) || defined(CONFIG_EOSM2) || defined(CONFIG_100D)
-    uint32_t dmaFlags = EDMAC_2_BYTES_PER_TRANSFER;
+    uint32_t dmaFlags = raw_slurp_dma_flags ? raw_slurp_dma_flags : EDMAC_2_BYTES_PER_TRANSFER;
 #elif defined(CONFIG_6D)
     uint32_t dmaFlags = EDMAC_4_BYTES_PER_TRANSFER;
 #else
@@ -428,7 +431,7 @@ static void raw_slurp_start(void* dst, int w, int h)
 {
     /* see wiki, register map, EDMAC what the flags mean. they are for setting up copy block size */
 #if defined(CONFIG_650D) || defined(CONFIG_700D) || defined(CONFIG_EOSM) || defined(CONFIG_EOSM2) || defined(CONFIG_100D)
-    uint32_t dmaFlags = EDMAC_2_BYTES_PER_TRANSFER;
+    uint32_t dmaFlags = raw_slurp_dma_flags ? raw_slurp_dma_flags : EDMAC_2_BYTES_PER_TRANSFER;
 #elif defined(CONFIG_6D)
     uint32_t dmaFlags = EDMAC_4_BYTES_PER_TRANSFER;
 #else
