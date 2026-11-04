@@ -94,6 +94,7 @@ static CONFIG_INT("raw.own_buffer", raw_own_buffer, 0);
 static int raw_slurp_active = 1;    /* latched in raw_lv_enable */
 static int lv_raw_enabled_ext();
 static void raw_slurp_stop_channel();
+static volatile int canon_raw_stopped = 0;   /* lv_save_raw switched off at a mode change */
 /* crop_rec "1080p 3x3 (Canon AF)" (EOS M2): Canon's recording route starves the slurp (3% of
  * frames lose 7-14 lines mid-frame); Canon's own raw DMA (lv_save_raw) records it cleanly */
 static int raw_force_canon = 0;
@@ -2606,7 +2607,8 @@ static void raw_lv_enable()
     
 #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
     /* the method can only change while the raw stream is off */
-    raw_slurp_active = RAW_SLURP_WANTED;
+    /* Canon's lv_save_raw only in movie mode (photo LiveView: slurp) */
+    raw_slurp_active = RAW_SLURP_WANTED || !is_movie_mode();
     printf("LV raw: %s\n", raw_slurp_active ? "EDMAC slurp" : "lv_save_raw");
 #endif
 
@@ -2617,6 +2619,7 @@ static void raw_lv_enable()
     {
     #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
         raw_slurp_stop_channel();   /* in case the slurp ran earlier in this session */
+        canon_raw_stopped = 0;
     #endif
         call("lv_save_raw", 1);
     }
@@ -2672,6 +2675,20 @@ static void raw_slurp_stop_channel()
 }
 #endif
 
+#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+/* EOS M2: Canon's lv_save_raw still on while the camera switches photo <-> movie hangs Canon's
+ * display and GUI (black screen, no buttons / USB, AF still running), with or without crop_rec.
+ * The shooting mode property arrives before LiveView is rebuilt: switch it off right there. */
+PROP_HANDLER(PROP_SHOOTING_MODE)
+{
+    if (lv_raw_enabled_ext() && !RAW_SLURP && !canon_raw_stopped)
+    {
+        call("lv_save_raw", 0);
+        canon_raw_stopped = 1;
+    }
+}
+#endif
+
 static void raw_lv_disable()
 {
     ASSERT(!lv_raw_gain);
@@ -2685,7 +2702,12 @@ static void raw_lv_disable()
     raw_info.buffer = 0;
 
 #ifdef RAW_HAVE_SAVE_RAW
+    #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
+    if (!RAW_SLURP && !canon_raw_stopped) call("lv_save_raw", 0);
+    canon_raw_stopped = 0;
+    #else
     if (!RAW_SLURP) call("lv_save_raw", 0);
+    #endif
 #endif
 
 #ifdef CONFIG_ALLOCATE_RAW_LV_BUFFER
