@@ -868,6 +868,8 @@ static struct {
     uint8_t pool[LVCI_POOL];
 } lvci = { 0x3149434C /* "LCI1" */, 0, 0 };
 static volatile uint32_t lvci_len = sizeof(lvci);
+static volatile uint32_t lvci_skipped = 0;          /* records that were not the movie standby one */
+static volatile int32_t lvci_skipped_last[4];
 static uint8_t lvci_tmp[64];
 
 static struct lvci_entry * lvci_find(uint32_t off, uint32_t size, int create)
@@ -911,6 +913,19 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     /* not during H.264 recording (Canon's own 3x3), but yes while recording raw: RECORDING
      * includes raw, and skipping there let a half-press drop the sensor to 5x3 (stopped the MLV) */
     if (RECORDING_H264 || !mode || off != 4 || size != 52) return;
+    /* only Canon's movie standby record (block +0x08..+0x18 = 2, 1, 1, ., 0): during a photo ->
+     * movie switch Canon still writes other records (photo LiveView) while is_movie_mode() is
+     * already true; giving those the recording values hung the camera */
+    {
+        const int32_t * w = (const int32_t *) src;
+        if (w[1] != 2 || w[2] != 1 || w[3] != 1 || w[5] != 0)
+        {
+            lvci_skipped++;
+            lvci_skipped_last[0] = w[1]; lvci_skipped_last[1] = w[2];
+            lvci_skipped_last[2] = w[3]; lvci_skipped_last[3] = w[5];
+            return;
+        }
+    }
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
@@ -3750,8 +3765,9 @@ static MENU_UPDATE_FUNC(lvci_menu_update)
     int mode_rec = rec ? *(int32_t *)(lvci.pool + e->rec_pos + 8) : -1;
     int mode_stb = stb ? *(int32_t *)(lvci.pool + e->stb_pos + 8) : -1;
     MENU_SET_RINFO("LV mode stb %d rec %d", mode_stb, mode_rec);
-    MENU_SET_WARNING(MENU_WARN_INFO, "%s values. Substituted %d. Crop preset OFF, standby only. Restart LiveView.",
-        rec ? "Captured recording" : "Built-in 1080p recording", e ? e->n_used : 0);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%s values. Substituted %d, other records left %d (last %d %d %d %d).",
+        rec ? "Captured recording" : "Built-in 1080p recording", e ? e->n_used : 0, lvci_skipped,
+        lvci_skipped_last[0], lvci_skipped_last[1], lvci_skipped_last[2], lvci_skipped_last[3]);
 }
 
 static MENU_UPDATE_FUNC(path_menu_update)
