@@ -533,7 +533,9 @@ static void FAST default_movie_cropmarks()
                 /* default cropmarks are black */
                 /* border pixels should be brighter, to be visible in dark */
                 int border = (x > x1-2 && x < x2+2 && y > y1-2 && y < y2+2);
-                newcolor = cropmarks_full_frame ? COLOR_TRANSPARENT_BLACK :
+                /* full frame: draw nothing (the info bars then use their own semi-transparent
+                 * background, COLOR_BG_DARK, instead of borrowing black from here) */
+                newcolor = cropmarks_full_frame ? 0 :
                            border ? COLOR_GRAY(70) : COLOR_BLACK;
             }
             
