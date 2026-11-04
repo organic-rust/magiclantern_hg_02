@@ -583,6 +583,8 @@ void set_movie_cropmarks(int x, int y, int w, int h)
     cropmarks_y = (y << 16) | (y + h);
 }
 
+int cropmarks_is_full_frame() { return cropmarks_full_frame; }
+
 void reset_movie_cropmarks()
 {
     cropmarks_full_frame = 0;

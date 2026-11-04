@@ -1,4 +1,5 @@
 #include <dryos.h>
+extern int cropmarks_is_full_frame() __attribute__((weak));   /* cropmarks.c */
 #include <property.h>
 #include <menu.h>
 #include <bmp.h>
@@ -491,6 +492,9 @@ void lvinfo_align_and_display(struct lvinfo_item * items[], int count, int bar_x
     /* try to borrow the color from the cropmarks; if it's fully transparent, use transparent gray */
     int bg = (items == top_items) ? TOPBAR_BGCOLOR : BOTTOMBAR_BGCOLOR;
     if (bg == 0) bg = COLOR_BG_DARK;
+    /* no cropmarks to borrow from (the recording covers the whole image): always semi-transparent,
+     * whatever Canon or ML happened to draw in the screen corner */
+    if (cropmarks_is_full_frame && cropmarks_is_full_frame()) bg = COLOR_BG_DARK;
     default_font = FONT(default_font, COLOR_WHITE, bg);
     small_font = FONT(small_font, COLOR_WHITE, bg);
     
