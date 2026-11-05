@@ -789,7 +789,7 @@ def main():
             import re
             found = set()
             for base in range(0x00100000, 0x01000000, CHUNK):
-                for m in re.finditer(rb"[A-Z]:/DCIM/[0-9A-Z_]{8}/[A-Z0-9_-]{4,8}\.MLV", ptp.read(base, CHUNK)):
+                for m in re.finditer(rb"[A-Z]:/DCIM/[0-9A-Z_]{8}/[A-Z0-9_-]{4,15}\.MLV", ptp.read(base, CHUNK)):
                     found.add(m.group().decode())
             for f in sorted(found):
                 print(f)
