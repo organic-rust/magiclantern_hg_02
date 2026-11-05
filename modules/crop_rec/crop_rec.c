@@ -3426,6 +3426,10 @@ static void dmlog_save_as(const char * filename)
     if (!f) { dmlog_paused = 0; NotifyBox(2000, "Cannot create %s", filename); return; }
 
     char * line = malloc(512);
+    /* one write per line took ~25 s, with capture paused all that time */
+    const int outsize = 32 * 1024;
+    char * out = malloc(outsize);
+    int out_len = 0;
     int w = dmlog_w;
     int start = (w > DMLOG_N) ? w - DMLOG_N : 0;
     int written = 0;
@@ -3468,9 +3472,19 @@ static void dmlog_save_as(const char * filename)
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
         if (e->rep && len < 480) len += snprintf(line + len, 512 - len, "  (x%d)", e->rep + 1);
         line[len++] = '\n';
-        FIO_WriteFile(f, line, len);
+        if (out)
+        {
+            if (out_len + len > outsize) { FIO_WriteFile(f, out, out_len); out_len = 0; }
+            memcpy(out + out_len, line, len);
+            out_len += len;
+        }
+        else
+        {
+            FIO_WriteFile(f, line, len);
+        }
         written++;
     }
+    if (out) { if (out_len) FIO_WriteFile(f, out, out_len); free(out); }
     free(line);
     FIO_CloseFile(f);
     dmlog_paused = 0;
@@ -5056,14 +5070,12 @@ static void cr_ptp_poll(void)
 /* ---------------------------------------------------------------------------
  * Mode switch recorder (test builds, EOS M2): photo <-> movie can hang with a black screen, no
  * buttons and no USB, so nothing can be read at the moment it happens. Runs in its own task, not
- * in shoot_task, and does not depend on lv. After each shooting mode change, or when the display
- * stops updating, it saves:
+ * in shoot_task, and does not depend on lv. After each shooting mode change it saves:
  *   ML/MSWnn.TXT   state at 10 Hz, then every task's state, wait object and saved stack
  *   ML/MSWnnL.TXT  Canon's DebugMsg log around the change
  * LED: fast blink = watching (the task is alive), solid = writing, off = saved.
  * --------------------------------------------------------------------------- */
 #define MSW_WINDOW_MS   8000
-#define MSW_STUCK_MS    3000
 #define MSW_SAMPLES     256
 #define MSW_MAX_SAVES   20
 #define MSW_TASKS_SIZE  (64*1024)      /* ~117 tasks, ~520 bytes each */
@@ -5076,7 +5088,7 @@ static struct msw_sample msw_samples[MSW_SAMPLES];
 static volatile int msw_nsamples = 0;
 static char msw_tasks[MSW_TASKS_SIZE];
 static volatile int msw_tasks_len = 0;
-static volatile int msw_save_request = 0;           /* 1: mode change, 2: display stuck */
+static volatile int msw_save_request = 0;
 static volatile int msw_saving = 0;
 
 static void msw_tasks_snapshot()
@@ -5114,6 +5126,19 @@ static void msw_tasks_snapshot()
     msw_tasks_len = n;
 }
 
+/* Evf's frame interrupt, RAM 0x13180: only runs in its "3rd Frame" state (ctx+0x30 == 2). In the
+ * hang this repeats every frame; it leaves that state once (flags+0x38 & 0xE) | Disp is nonzero
+ * and flags+0xBEC is 0. Log what it actually sees (flags = ctx+0x4C, Disp = r7). */
+#define EVF_3RD_ADDR    0x13180
+#define EVF_3RD_INSN    0xE594004C      /* ldr r0, [r4, #0x4C] */
+static void FAST msw_evf3_hook(uint32_t * regs, uint32_t * stack, uint32_t pc)
+{
+    uint32_t ctx = regs[4];
+    uint32_t flags = MEM(ctx + 0x4C), other = MEM(ctx + 0x48);
+    dmlog_add(DM_MARKER, 0, "*** MSW evf3 ctx %x flags %x +38 %x Disp %x bec %x", ctx, flags, MEM(flags + 0x38), regs[7], MEM(flags + 0xBEC));
+    dmlog_add(DM_MARKER, 0, "*** MSW evf3 +08 %x +0c %x +10 %x other+38 %x r5+4 %x", MEM(flags + 8), MEM(flags + 0xC), MEM(flags + 0x10), MEM(other + 0x38), MEM(regs[5] + 4));
+}
+
 /* card writes block if the file task hangs: keep them away from msw_watch_task, so the LED still
  * shows whether ML is running, and write the small state file first */
 static void msw_save_task()
@@ -5137,18 +5162,16 @@ static void msw_save_task()
         FILE * f = FIO_CreateFile(name);
         if (f)
         {
-            static char line[160];
-            int len = snprintf(line, sizeof(line), "# trigger %s; t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago\n",
-                msw_save_request == 1 ? "mode change" : "display stuck");
-            FIO_WriteFile(f, line, len);
+            static char buf[MSW_SAMPLES * 80 + 100];
+            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago\n");
             int total = msw_nsamples;
             for (int i = MAX(0, total - MSW_SAMPLES); i < total; i++)
             {
                 struct msw_sample * e = &msw_samples[i % MSW_SAMPLES];
-                len = snprintf(line, sizeof(line), "%d %d %d %d %d %d %d %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
+                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
                     e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago);
-                FIO_WriteFile(f, line, len);
             }
+            FIO_WriteFile(f, buf, len);
             FIO_WriteFile(f, msw_tasks, msw_tasks_len);
             FIO_CloseFile(f);
         }
@@ -5168,10 +5191,10 @@ static void msw_watch_task()
     if (!dmlog_hooked) return;
     msw_on = 1;
     frz_trace = 2;
+    int hook_err = patch_hook_function(EVF_3RD_ADDR, EVF_3RD_INSN, &msw_evf3_hook, "crop_rec: Evf 3rd frame");
+    dmlog_add(DM_MARKER, 0, "*** MSW start, evf3 hook %d", hook_err, 0, 0, 0, 0);
 
     int last_mode = shooting_mode, t_change = 0;
-    uint32_t last_disp = 0;
-    int t_disp = get_ms_clock(), disp_changes = 0, stuck_reported = 0;
     int saves = 0, reason = 0;
 
     TASK_LOOP
@@ -5188,10 +5211,8 @@ static void msw_watch_task()
         e->menu = gui_menu_shown(); e->raw = raw_lv_is_enabled();
         msw_nsamples++;
 
-        if (disp != last_disp) { last_disp = disp; t_disp = now; disp_changes++; stuck_reported = 0; }
-
         /* a new switch while the previous one is still being watched just restarts the window */
-        if (shooting_mode != last_mode && !msw_saving)
+        if (shooting_mode != last_mode)
         {
             dmlog_add(DM_MARKER, 0, "*** MSW shooting mode %d -> %d, lv %d", last_mode, shooting_mode, lv, 0, 0);
             last_mode = shooting_mode;
@@ -5200,22 +5221,11 @@ static void msw_watch_task()
             reason = 1;
         }
 
-        /* in case the shooting mode property never arrives; ML menu and recording excluded */
-        if (!t_change && !msw_saving && !stuck_reported && disp_changes >= 3 && now - t_disp > MSW_STUCK_MS &&
-            !gui_menu_shown() && !RECORDING)
-        {
-            dmlog_add(DM_MARKER, 0, "*** MSW display stuck %d ms, lv %d", now - t_disp, lv, 0, 0, 0);
-            stuck_reported = 1;
-            frz_stop_at = dmlog_w + 300;
-            t_change = now;
-            reason = 2;
-        }
-
         if (t_change)
         {
             if (k & 1) info_led_on(); else info_led_off();
 
-            if (now - t_change > MSW_WINDOW_MS)
+            if (now - t_change > MSW_WINDOW_MS && !msw_saving)
             {
                 t_change = 0;
                 if (RECORDING || saves >= MSW_MAX_SAVES) { frz_stop_at = 0; info_led_off(); continue; }
