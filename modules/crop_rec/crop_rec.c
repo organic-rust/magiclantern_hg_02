@@ -910,13 +910,20 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
      * 2, 1, 1, 0 standby; 4, 0, 0, 1 recording. Anything else is left alone. In particular Canon's
      * LiveView start-up record, written on photo -> movie (5, 0, 0, .): testing +0x0C alone stored
      * it as the recording values, and standby was then replaced with it for good, so Evf never
-     * finished starting: black screen, HD path stopped, buttons and USB dead, AF still running. */
-    static int burst_kind = 0;      /* 0 other, 1 standby, 2 recording */
+     * finished starting: black screen, HD path stopped, buttons and USB dead, AF still running.
+     * On half-press Canon also writes 7, 12, 1, 0 (sensor at 120 Hz, HD path stopped, so LiveView
+     * freezes until release) and 0, 1, 1, 0 (5x3, raw height 697; stops an MLV). Replace those
+     * too, so a half-press keeps the mode already in use. Named one by one on purpose. */
+    static int burst_kind = 0;      /* 0 other, 1 standby, 2 recording, 3 half-press */
     if (off == 4 && size == 52)
     {
         const int32_t * w = (const int32_t *) src;
         burst_kind = (w[1] == 2 && w[2] == 1 && w[3] == 1 && w[5] == 0) ? 1 :
-                     (w[1] == 4 && w[2] == 0 && w[3] == 0 && w[5] == 1) ? 2 : 0;
+                     (w[1] == 4 && w[2] == 0 && w[3] == 0 && w[5] == 1) ? 2 :
+                     (w[1] == 7 && w[2] == 12 && w[3] == 1 && w[5] == 0) ? 3 :
+                     (w[1] == 0 && w[2] == 1 && w[3] == 1 && w[5] == 0) ? 3 : 0;
+        if (burst_kind == 3 && !RECORDING_H264)
+            dmlog_add(DM_MARKER, 0, "*** lvci half-press record %d %d %d %d, replaced", w[1], w[2], w[3], w[5], 0);
         if (!burst_kind)
         {
             lvci_skipped++;
@@ -931,13 +938,16 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
         memcpy(lvci.pool + e->rec_pos, src, size); e->rec_ok = 1; e->n_rec++;
         return;
     }
-    memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++;
+    if (burst_kind == 1) { memcpy(lvci.pool + e->stb_pos, src, size); e->stb_ok = 1; e->n_stb++; }
     /* not during H.264 recording (Canon's own 3x3), but yes while recording raw: RECORDING
      * includes raw, and skipping there let a half-press drop the sensor to 5x3 (stopped the MLV) */
     if (RECORDING_H264 || !mode || off != 4 || size != 52) return;
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
+    /* half-press: start from the standby record, not from the 120 Hz / 5x3 one */
+    if (burst_kind == 3 && e->stb_ok)
+        memcpy(lvci_tmp, lvci.pool + e->stb_pos, size);
     if (e->rec_ok && mode == 1)
         memcpy(lvci_tmp, lvci.pool + e->rec_pos, size);
     else if (mode == 1)
