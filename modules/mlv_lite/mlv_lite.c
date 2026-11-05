@@ -1889,19 +1889,10 @@ static REQUIRES(ShootTask)
 void raw_lv_request_update()
 {
     static int raw_lv_requested = 0;
-    static int movie_lv_since = 0;
 
-    /* wait until movie LiveView has settled: switching photo -> movie, LiveView keeps running
-     * and is_movie_mode() flips while Canon is still rebuilding it; starting the raw stream
-     * then (with Canon's lv_save_raw, EOS M2 1080p 3x3 preset) hung Canon's display / GUI */
-    int movie_lv = raw_video_enabled && lv && is_movie_mode();
-    if (!movie_lv) movie_lv_since = 0;
-    else if (!movie_lv_since) movie_lv_since = get_ms_clock();
-    int settled = movie_lv && get_ms_clock() - movie_lv_since > 1500;
-
-    if (movie_lv)
+    if (raw_video_enabled && lv && is_movie_mode())
     {
-        if (!raw_lv_requested && settled)
+        if (!raw_lv_requested)
         {
             raw_video_enable();
             raw_lv_requested = 1;
