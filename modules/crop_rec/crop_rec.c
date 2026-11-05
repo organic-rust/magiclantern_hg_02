@@ -5312,8 +5312,8 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
 
     msw_shoot_hb = get_ms_clock();
 
-    /* Canon 3x3 preset: every good start goes through the LiveView restart below (boot, menu);
-     * returning from photo mode had none, and Canon's HD path stayed stopped (black screen) */
+    /* Canon 3x3 preset: returning from photo mode needs the LiveView restart below too. The raw
+     * stream may be on the slurp there, and this preset needs Canon's lv_save_raw in movie mode */
     static int last_movie = -1;
     int movie_now = is_movie_mode();
     if (last_movie == 0 && movie_now && CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2)
