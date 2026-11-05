@@ -906,10 +906,27 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     struct lvci_entry * e = lvci_find(off, size, 1);
     if (!e) return;
     /* Canon writes the new state's blocks just before RECORDING changes, so classify each burst by
-     * its own LV mode (52-byte record first, its +8 = block +0x0C: 0 recording, 1 standby) */
-    static int burst_rec = 0;
-    if (off == 4 && size == 52) burst_rec = (*(const int32_t *)(src + 8) == 0);
-    if (burst_rec)
+     * its own 52-byte record (written first; block +0x08, +0x0C, +0x10, +0x18):
+     * 2, 1, 1, 0 standby; 4, 0, 0, 1 recording. Anything else is left alone. In particular Canon's
+     * LiveView start-up record, written on photo -> movie (5, 0, 0, .): testing +0x0C alone stored
+     * it as the recording values, and standby was then replaced with it for good, so Evf never
+     * finished starting: black screen, HD path stopped, buttons and USB dead, AF still running. */
+    static int burst_kind = 0;      /* 0 other, 1 standby, 2 recording */
+    if (off == 4 && size == 52)
+    {
+        const int32_t * w = (const int32_t *) src;
+        burst_kind = (w[1] == 2 && w[2] == 1 && w[3] == 1 && w[5] == 0) ? 1 :
+                     (w[1] == 4 && w[2] == 0 && w[3] == 0 && w[5] == 1) ? 2 : 0;
+        if (!burst_kind)
+        {
+            lvci_skipped++;
+            lvci_skipped_last[0] = w[1]; lvci_skipped_last[1] = w[2];
+            lvci_skipped_last[2] = w[3]; lvci_skipped_last[3] = w[5];
+            dmlog_add(DM_MARKER, 0, "*** lvci other record %d %d %d %d, left alone", w[1], w[2], w[3], w[5], 0);
+        }
+    }
+    if (!burst_kind) return;
+    if (burst_kind == 2)
     {
         memcpy(lvci.pool + e->rec_pos, src, size); e->rec_ok = 1; e->n_rec++;
         return;
@@ -918,19 +935,6 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     /* not during H.264 recording (Canon's own 3x3), but yes while recording raw: RECORDING
      * includes raw, and skipping there let a half-press drop the sensor to 5x3 (stopped the MLV) */
     if (RECORDING_H264 || !mode || off != 4 || size != 52) return;
-    /* only Canon's movie standby record (block +0x08..+0x18 = 2, 1, 1, ., 0): during a photo ->
-     * movie switch Canon still writes other records (photo LiveView) while is_movie_mode() is
-     * already true; giving those the recording values hung the camera */
-    {
-        const int32_t * w = (const int32_t *) src;
-        if (w[1] != 2 || w[2] != 1 || w[3] != 1 || w[5] != 0)
-        {
-            lvci_skipped++;
-            lvci_skipped_last[0] = w[1]; lvci_skipped_last[1] = w[2];
-            lvci_skipped_last[2] = w[3]; lvci_skipped_last[3] = w[5];
-            return;
-        }
-    }
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
