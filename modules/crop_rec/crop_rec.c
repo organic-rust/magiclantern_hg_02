@@ -5091,9 +5091,11 @@ static void cr_ptp_poll(void)
 #define M2_TASK_SIZE    0x54
 
 struct msw_sample { int t; uint32_t disp, lvdma, hddma; int vsync, shoot_ago; uint8_t mode, lv, paused, gui, menu, raw;
-    int evf3; uint32_t evf_disp, evf_38, evf_08, g16, g28; };
+    int evf3; uint32_t evf_disp, evf_38, evf_08, g16, g28;
+    uint8_t half; uint32_t b08, b0c, b10, b18, raw_w, raw_h; };
 static volatile int msw_evf3_count = 0;
 static volatile uint32_t msw_evf_disp, msw_evf_38, msw_evf_08;
+static volatile uint32_t msw_evf_ctx = 0;
 static struct msw_sample msw_samples[MSW_SAMPLES];
 static volatile int msw_nsamples = 0;
 static char msw_tasks[MSW_TASKS_SIZE];
@@ -5145,6 +5147,7 @@ static void msw_tasks_snapshot()
 static void FAST msw_evf3_hook(uint32_t * regs, uint32_t * stack, uint32_t pc)
 {
     uint32_t ctx = regs[4];
+    msw_evf_ctx = ctx;
     uint32_t flags = MEM(ctx + 0x4C), other = MEM(ctx + 0x48);
     uint32_t v38 = MEM(flags + 0x38), v08 = MEM(flags + 8);
     /* only when something changes, so it can't fill the log */
@@ -5180,14 +5183,15 @@ static void msw_save_task()
         FILE * f = FIO_CreateFile(name);
         if (f)
         {
-            static char buf[MSW_SAMPLES * 130 + 100];
-            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago evf3 evfDisp evf38 evf08 g16 g28\n");
+            static char buf[MSW_SAMPLES * 180 + 100];
+            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago evf3 evfDisp evf38 evf08 g16 g28 half b08 b0c b10 b18 rawW rawH\n");
             int total = msw_nsamples;
             for (int i = MAX(0, total - MSW_SAMPLES); i < total; i++)
             {
                 struct msw_sample * e = &msw_samples[i % MSW_SAMPLES];
-                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d %d %x %x %x %x %x\n", e->t, e->mode, e->lv, e->paused,
-                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago, e->evf3, e->evf_disp, e->evf_38, e->evf_08, e->g16, e->g28);
+                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d %d %x %x %x %x %x %d %x %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
+                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago, e->evf3, e->evf_disp, e->evf_38, e->evf_08, e->g16, e->g28,
+                    e->half, e->b08, e->b0c, e->b10, e->b18, e->raw_w, e->raw_h);
             }
             FIO_WriteFile(f, buf, len);
             FIO_WriteFile(f, msw_tasks, msw_tasks_len);
@@ -5229,6 +5233,14 @@ static void msw_watch_task()
         e->menu = gui_menu_shown(); e->raw = raw_lv_is_enabled();
         e->evf3 = msw_evf3_count; e->evf_disp = msw_evf_disp; e->evf_38 = msw_evf_38; e->evf_08 = msw_evf_08;
         { uint32_t g = MEM(MSW_EVF_GLOBAL); e->g16 = g ? MEM(g + 16) : 0xFFFF; e->g28 = g ? MEM(g + 28) : 0xFFFF; }
+        e->half = get_halfshutter_pressed();
+        e->raw_w = raw_info.jpeg.width; e->raw_h = raw_info.jpeg.height;
+        {
+            /* Canon's current per-frame settings: which LV record is really in use */
+            uint32_t flags = msw_evf_ctx ? MEM(msw_evf_ctx + 0x4C) : 0;
+            e->b08 = flags ? MEM(flags + 0x08) : 0xFF; e->b0c = flags ? MEM(flags + 0x0C) : 0xFF;
+            e->b10 = flags ? MEM(flags + 0x10) : 0xFF; e->b18 = flags ? MEM(flags + 0x18) : 0xFF;
+        }
         msw_nsamples++;
 
         /* a new switch while the previous one is still being watched just restarts the window */
@@ -5239,6 +5251,24 @@ static void msw_watch_task()
             if (!t_change) frz_stop_at = dmlog_w + 3500;    /* keep what follows, even if AF floods the log */
             t_change = now;
             reason = 1;
+        }
+
+        /* half-press: same as a mode switch; the window starts when it's released */
+        {
+            static int last_half = 0;
+            int half = get_halfshutter_pressed();
+            if (half && !last_half)
+            {
+                dmlog_add(DM_MARKER, 0, "*** MSW half-press, lv %d, mode %d", lv, shooting_mode, 0, 0, 0);
+                if (!t_change) frz_stop_at = dmlog_w + 3500;
+                reason = 1;
+            }
+            else if (!half && last_half)
+            {
+                dmlog_add(DM_MARKER, 0, "*** MSW half-press released", 0, 0, 0, 0, 0);
+            }
+            if (half) t_change = now;
+            last_half = half;
         }
 
         if (t_change)
