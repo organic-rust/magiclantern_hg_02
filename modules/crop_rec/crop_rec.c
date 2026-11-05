@@ -240,6 +240,8 @@ static volatile int gmt_trace = 0;          /* AF frame trace: only Gmt classes,
 static volatile int saf_trace_cls = -1;     /* when >= 0, Freeze trace keeps only this class, 154 and markers */
 static volatile int frz_trace = 0;          /* freeze trace: all classes, repeats collapsed, stops after a LV freeze */
 static volatile int frz_stop_at = 0;        /* 0 = running; else stop when dmlog_w reaches it */
+static volatile int msw_on = 0;             /* mode switch recorder owns the capture (see msw_watch_task) */
+static volatile int msw_shoot_hb = 0;       /* last time shoot_task ran our polling CBR */
 static uint32_t dm_cls_count[256];          /* messages per class (before collapsing), for the file header */
 static volatile int dmlog_paused = 0;
 static volatile int dmlog_stop_at = 0;      /* 0 = free running; else freeze when dmlog_w reaches it */
@@ -3614,7 +3616,7 @@ static void saf_snap_poll(void)
 
 static void frz_trace_poll()
 {
-    if (!frz_trace || !is_EOSM2) return;
+    if (!frz_trace || !is_EOSM2 || msw_on) return;
 
     /* after a freeze, save the log by itself once capture has stopped (or 2 s later), so it
      * survives a battery pull when the camera can't be operated any more */
@@ -5051,11 +5053,197 @@ static void cr_ptp_poll(void)
     cr_ptp.cmd_done = cmd;
 }
 
+/* ---------------------------------------------------------------------------
+ * Mode switch recorder (test builds, EOS M2): photo <-> movie can hang with a black screen, no
+ * buttons and no USB, so nothing can be read at the moment it happens. Runs in its own task, not
+ * in shoot_task, and does not depend on lv. After each shooting mode change, or when the display
+ * stops updating, it saves:
+ *   ML/MSWnn.TXT   state at 10 Hz, then every task's state, wait object and saved stack
+ *   ML/MSWnnL.TXT  Canon's DebugMsg log around the change
+ * LED: fast blink = watching (the task is alive), solid = writing, off = saved.
+ * --------------------------------------------------------------------------- */
+#define MSW_WINDOW_MS   8000
+#define MSW_STUCK_MS    3000
+#define MSW_SAMPLES     256
+#define MSW_MAX_SAVES   20
+#define MSW_TASKS_SIZE  (64*1024)      /* ~117 tasks, ~520 bytes each */
+#define MSW_STACK_WORDS 48
+#define M2_TASK_TABLE   (*(volatile uint32_t *)0x90F80)     /* is_taskid_valid, FFD74A20 */
+#define M2_TASK_SIZE    0x54
+
+struct msw_sample { int t; uint32_t disp, lvdma, hddma; int vsync, shoot_ago; uint8_t mode, lv, paused, gui, menu, raw; };
+static struct msw_sample msw_samples[MSW_SAMPLES];
+static volatile int msw_nsamples = 0;
+static char msw_tasks[MSW_TASKS_SIZE];
+static volatile int msw_tasks_len = 0;
+static volatile int msw_save_request = 0;           /* 1: mode change, 2: display stuck */
+static volatile int msw_saving = 0;
+
+static void msw_tasks_snapshot()
+{
+    extern unsigned int task_max;
+    extern int is_taskid_valid(int, int, void *);
+    int n = 0;
+    uint32_t table = M2_TASK_TABLE;
+    n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "# %d tasks; current %s; wait: 0 sleep 1 sem 2 flag 3 sendmq 4 recvmq 5 mutex; state: 0 ready 1 wait 2 susp\n",
+        task_max, current_task ? current_task->name : "?");
+    for (int id = 1; id <= (int) task_max && n < MSW_TASKS_SIZE - 900; id++)
+    {
+        struct task_attr_str a;
+        if (is_taskid_valid(1, id, &a) != 0) continue;
+        uint32_t tp = table + (id - 1) * M2_TASK_SIZE;
+        uint32_t wait_obj = MEM(tp + 0x14);
+        uint32_t ctx = MEM(tp + 0x50);       /* checked over USB: on its own stack for all tasks */
+        n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "%d %s pri %x wait %d state %d obj %x entry %x stack %x+%x", id,
+            a.name ? (char *) a.name : "?", a.pri, a.wait_id, a.state, wait_obj, a.entry, a.stack, a.size);
+        int ok = ctx >= a.stack && ctx + 0x40 <= a.stack + a.size;
+        if (ok)
+        {
+            struct context * c = (struct context *) ctx;
+            n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " sp %x pc %x lr %x\n ", ctx, c->pc, c->lr);
+            uint32_t sp = ctx + 0x40;
+            for (int i = 0; i < MSW_STACK_WORDS && sp + i * 4 < a.stack + a.size; i++)
+                n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " %x", MEM(sp + i * 4));
+        }
+        else
+        {
+            n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " ctx %x (not on its stack)", ctx);
+        }
+        n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "\n");
+    }
+    msw_tasks_len = n;
+}
+
+/* card writes block if the file task hangs: keep them away from msw_watch_task, so the LED still
+ * shows whether ML is running, and write the small state file first */
+static void msw_save_task()
+{
+    TASK_LOOP
+    {
+        msleep(50);
+        if (!msw_save_request) continue;
+
+        char name[20], logname[20];
+        int num = 0;
+        for (num = 0; num < 99; num++)
+        {
+            uint32_t size;
+            snprintf(name, sizeof(name), "ML/MSW%02d.TXT", num);
+            if (FIO_GetFileSize(name, &size) != 0) break;
+        }
+        snprintf(name, sizeof(name), "ML/MSW%02d.TXT", num);
+        snprintf(logname, sizeof(logname), "ML/MSW%02dL.TXT", num);
+
+        FILE * f = FIO_CreateFile(name);
+        if (f)
+        {
+            static char line[160];
+            int len = snprintf(line, sizeof(line), "# trigger %s; t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago\n",
+                msw_save_request == 1 ? "mode change" : "display stuck");
+            FIO_WriteFile(f, line, len);
+            int total = msw_nsamples;
+            for (int i = MAX(0, total - MSW_SAMPLES); i < total; i++)
+            {
+                struct msw_sample * e = &msw_samples[i % MSW_SAMPLES];
+                len = snprintf(line, sizeof(line), "%d %d %d %d %d %d %d %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
+                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago);
+                FIO_WriteFile(f, line, len);
+            }
+            FIO_WriteFile(f, msw_tasks, msw_tasks_len);
+            FIO_CloseFile(f);
+        }
+        dmlog_save_as(logname);
+
+        frz_stop_at = 0;
+        msw_save_request = 0;
+        msw_saving = 0;
+    }
+}
+
+static void msw_watch_task()
+{
+    /* same capture as Freeze trace; started after boot, as from the menu */
+    msleep(5000);
+    if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
+    if (!dmlog_hooked) return;
+    msw_on = 1;
+    frz_trace = 2;
+
+    int last_mode = shooting_mode, t_change = 0;
+    uint32_t last_disp = 0;
+    int t_disp = get_ms_clock(), disp_changes = 0, stuck_reported = 0;
+    int saves = 0, reason = 0;
+
+    TASK_LOOP
+    {
+        msleep(100);
+        int now = get_ms_clock();
+        uint32_t disp = M2_LV_DISPLAY_ADDR;
+
+        struct msw_sample * e = &msw_samples[msw_nsamples % MSW_SAMPLES];
+        e->t = now; e->disp = disp;
+        e->lvdma = shamem_read(M2_EDMAC_LV_ADDR); e->hddma = shamem_read(M2_EDMAC_HD_ADDR);
+        e->vsync = aflog_frames; e->shoot_ago = now - msw_shoot_hb;
+        e->mode = shooting_mode; e->lv = lv; e->paused = lv_paused; e->gui = gui_state;
+        e->menu = gui_menu_shown(); e->raw = raw_lv_is_enabled();
+        msw_nsamples++;
+
+        if (disp != last_disp) { last_disp = disp; t_disp = now; disp_changes++; stuck_reported = 0; }
+
+        /* a new switch while the previous one is still being watched just restarts the window */
+        if (shooting_mode != last_mode && !msw_saving)
+        {
+            dmlog_add(DM_MARKER, 0, "*** MSW shooting mode %d -> %d, lv %d", last_mode, shooting_mode, lv, 0, 0);
+            last_mode = shooting_mode;
+            if (!t_change) frz_stop_at = dmlog_w + 3500;    /* keep what follows, even if AF floods the log */
+            t_change = now;
+            reason = 1;
+        }
+
+        /* in case the shooting mode property never arrives; ML menu and recording excluded */
+        if (!t_change && !msw_saving && !stuck_reported && disp_changes >= 3 && now - t_disp > MSW_STUCK_MS &&
+            !gui_menu_shown() && !RECORDING)
+        {
+            dmlog_add(DM_MARKER, 0, "*** MSW display stuck %d ms, lv %d", now - t_disp, lv, 0, 0, 0);
+            stuck_reported = 1;
+            frz_stop_at = dmlog_w + 300;
+            t_change = now;
+            reason = 2;
+        }
+
+        if (t_change)
+        {
+            if (k & 1) info_led_on(); else info_led_off();
+
+            if (now - t_change > MSW_WINDOW_MS)
+            {
+                t_change = 0;
+                if (RECORDING || saves >= MSW_MAX_SAVES) { frz_stop_at = 0; info_led_off(); continue; }
+                saves++;
+                msw_tasks_snapshot();
+                msw_saving = 1;
+                msw_save_request = reason;
+                info_led_on();
+            }
+        }
+        else if (msw_saving)
+        {
+            info_led_on();
+        }
+        else if (reason)
+        {
+            reason = 0;
+            info_led_off();
+        }
+    }
+}
+
 static unsigned int crop_rec_polling_cbr(unsigned int unused)
 {
     /* also check at startup */
     static int lv_dirty = 1;
 
+    msw_shoot_hb = get_ms_clock();
     mcm_af_poll();
     gmt_trace_poll();
     frz_trace_poll();
@@ -5365,6 +5553,12 @@ static unsigned int crop_rec_init()
     update_patch();
 
     if (is_EOSM2) cr_ptp_init();
+
+    if (is_EOSM2)
+    {
+        task_create("msw_watch", 0x10, 0x1000, msw_watch_task, 0);
+        task_create("msw_save", 0x1d, 0x1000, msw_save_task, 0);
+    }
 
     return 0;
 }
