@@ -960,6 +960,26 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     e->n_used++;
 }
 
+/* Half-press AF (Canon 3x3 preset). Canon's AfAeReady, FF184E58, compares the frame index the AF
+ * sequence asks for with the current one: different -> StartModeChange (LiveView mode change,
+ * 2-3 frames lost at press and again at release), same -> next AF step directly (FF187B8C).
+ * In one-shot AF the request is 7 (120 fps): ask for the current index instead, so no mode change.
+ * 7 only, this preset only, not in H.264 recording. */
+#define AFSEQ_READY_ADDR    0xFF184EB0
+#define AFSEQ_READY_INSN    0xE5941DE4      /* ldr r1, [r4, #0xDE4] */
+static int afseq_hook_err = -1;
+static void FAST afseq_ready_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
+{
+    if (CROP_PRESET_MENU != CROP_PRESET_3x3_canon_EOSM2 || !is_movie_mode() || RECORDING_H264) return;
+    uint32_t g = regs[4];
+    uint32_t cur = MEM(g + 13 * 4 * MEM(g + 0x1AC) + 0xAC);
+    if (MEM(g + 0xDE4) == 7 && cur != 7)
+    {
+        dmlog_add(DM_MARKER, 0, "*** afseq: asked for frame index 7, using %d", cur, 0, 0, 0, 0);
+        MEM(g + 0xDE4) = cur;
+    }
+}
+
 #define SAF_START_ADDR      0xFF1020E4
 #define SAF_START_INSN      0xE92D4030      /* push {r4, r5, lr} */
 static int saf_start_hook_err = -1;
@@ -1255,6 +1275,10 @@ static void mcm_af_update()
     if (lvci_hook_err == -1)
     {
         lvci_hook_err = patch_hook_function(LVCI_SET_ADDR, LVCI_SET_INSN, &lvci_hook, "crop_rec: LV capture info");
+    }
+    if (afseq_hook_err == -1)
+    {
+        afseq_hook_err = patch_hook_function(AFSEQ_READY_ADDR, AFSEQ_READY_INSN, &afseq_ready_hook, "crop_rec: AF frame rate");
     }
     if (path_hook_err == -1)
     {
