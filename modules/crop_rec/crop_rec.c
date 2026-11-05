@@ -258,6 +258,9 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
         if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
         if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != 145 && cls != saf_trace_cls) return;   /* 145: [REG] sensor register writes */
         if (frz_trace && cls == 21) { dm_cls_count[21]++; return; }   /* register-write spam (~6000/s in mcm) */
+        /* recorder: the log only lasted ~0.5 s after a switch; drop register, AF, face and AE noise */
+        if (msw_on && (cls == 145 || cls == 173 || cls == 10 || cls == 0 || cls == 12 || cls == 178 || cls == 61 ||
+                       cls == 152 || cls == 177 || cls == 184 || cls == 170 || cls == 196 || cls == 175)) { dm_cls_count[cls & 0xFF]++; return; }
         if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
         if (w > 0)
@@ -5083,7 +5086,10 @@ static void cr_ptp_poll(void)
 #define M2_TASK_TABLE   (*(volatile uint32_t *)0x90F80)     /* is_taskid_valid, FFD74A20 */
 #define M2_TASK_SIZE    0x54
 
-struct msw_sample { int t; uint32_t disp, lvdma, hddma; int vsync, shoot_ago; uint8_t mode, lv, paused, gui, menu, raw; };
+struct msw_sample { int t; uint32_t disp, lvdma, hddma; int vsync, shoot_ago; uint8_t mode, lv, paused, gui, menu, raw;
+    int evf3; uint32_t evf_disp, evf_38, evf_08, g16, g28; };
+static volatile int msw_evf3_count = 0;
+static volatile uint32_t msw_evf_disp, msw_evf_38, msw_evf_08;
 static struct msw_sample msw_samples[MSW_SAMPLES];
 static volatile int msw_nsamples = 0;
 static char msw_tasks[MSW_TASKS_SIZE];
@@ -5131,12 +5137,20 @@ static void msw_tasks_snapshot()
  * and flags+0xBEC is 0. Log what it actually sees (flags = ctx+0x4C, Disp = r7). */
 #define EVF_3RD_ADDR    0x13180
 #define EVF_3RD_INSN    0xE594004C      /* ldr r0, [r4, #0x4C] */
+#define MSW_EVF_GLOBAL  0x924CC  /* Disp comes from RAM 0x1842C: global+0x10, or global+0x1C and arg+4 == 0 */
 static void FAST msw_evf3_hook(uint32_t * regs, uint32_t * stack, uint32_t pc)
 {
     uint32_t ctx = regs[4];
     uint32_t flags = MEM(ctx + 0x4C), other = MEM(ctx + 0x48);
-    dmlog_add(DM_MARKER, 0, "*** MSW evf3 ctx %x flags %x +38 %x Disp %x bec %x", ctx, flags, MEM(flags + 0x38), regs[7], MEM(flags + 0xBEC));
-    dmlog_add(DM_MARKER, 0, "*** MSW evf3 +08 %x +0c %x +10 %x other+38 %x r5+4 %x", MEM(flags + 8), MEM(flags + 0xC), MEM(flags + 0x10), MEM(other + 0x38), MEM(regs[5] + 4));
+    uint32_t v38 = MEM(flags + 0x38), v08 = MEM(flags + 8);
+    /* only when something changes, so it can't fill the log */
+    if (!msw_evf3_count || regs[7] != msw_evf_disp || v38 != msw_evf_38 || v08 != msw_evf_08)
+    {
+        dmlog_add(DM_MARKER, 0, "*** MSW evf3 ctx %x flags %x +38 %x Disp %x bec %x", ctx, flags, v38, regs[7], MEM(flags + 0xBEC));
+        dmlog_add(DM_MARKER, 0, "*** MSW evf3 +08 %x +0c %x +10 %x other+38 %x r5+4 %x", v08, MEM(flags + 0xC), MEM(flags + 0x10), MEM(other + 0x38), MEM(regs[5] + 4));
+    }
+    msw_evf_disp = regs[7]; msw_evf_38 = v38; msw_evf_08 = v08;
+    msw_evf3_count++;
 }
 
 /* card writes block if the file task hangs: keep them away from msw_watch_task, so the LED still
@@ -5162,14 +5176,14 @@ static void msw_save_task()
         FILE * f = FIO_CreateFile(name);
         if (f)
         {
-            static char buf[MSW_SAMPLES * 80 + 100];
-            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago\n");
+            static char buf[MSW_SAMPLES * 130 + 100];
+            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago evf3 evfDisp evf38 evf08 g16 g28\n");
             int total = msw_nsamples;
             for (int i = MAX(0, total - MSW_SAMPLES); i < total; i++)
             {
                 struct msw_sample * e = &msw_samples[i % MSW_SAMPLES];
-                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
-                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago);
+                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d %d %x %x %x %x %x\n", e->t, e->mode, e->lv, e->paused,
+                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago, e->evf3, e->evf_disp, e->evf_38, e->evf_08, e->g16, e->g28);
             }
             FIO_WriteFile(f, buf, len);
             FIO_WriteFile(f, msw_tasks, msw_tasks_len);
@@ -5209,6 +5223,8 @@ static void msw_watch_task()
         e->vsync = aflog_frames; e->shoot_ago = now - msw_shoot_hb;
         e->mode = shooting_mode; e->lv = lv; e->paused = lv_paused; e->gui = gui_state;
         e->menu = gui_menu_shown(); e->raw = raw_lv_is_enabled();
+        e->evf3 = msw_evf3_count; e->evf_disp = msw_evf_disp; e->evf_38 = msw_evf_38; e->evf_08 = msw_evf_08;
+        { uint32_t g = MEM(MSW_EVF_GLOBAL); e->g16 = g ? MEM(g + 16) : 0xFFFF; e->g28 = g ? MEM(g + 28) : 0xFFFF; }
         msw_nsamples++;
 
         /* a new switch while the previous one is still being watched just restarts the window */
@@ -5254,6 +5270,17 @@ static unsigned int crop_rec_polling_cbr(unsigned int unused)
     static int lv_dirty = 1;
 
     msw_shoot_hb = get_ms_clock();
+
+    /* Canon 3x3 preset: every good start goes through the LiveView restart below (boot, menu);
+     * returning from photo mode had none, and Canon's HD path stayed stopped (black screen) */
+    static int last_movie = -1;
+    int movie_now = is_movie_mode();
+    if (last_movie == 0 && movie_now && CROP_PRESET_MENU == CROP_PRESET_3x3_canon_EOSM2)
+    {
+        lv_dirty = 1;
+    }
+    last_movie = movie_now;
+
     mcm_af_poll();
     gmt_trace_poll();
     frz_trace_poll();
