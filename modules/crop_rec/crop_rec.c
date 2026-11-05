@@ -912,8 +912,8 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
      * it as the recording values, and standby was then replaced with it for good, so Evf never
      * finished starting: black screen, HD path stopped, buttons and USB dead, AF still running.
      * On half-press Canon also writes 7, 12, 1, 0 (sensor at 120 Hz, HD path stopped, so LiveView
-     * freezes until release) and 0, 1, 1, 0 (5x3, raw height 697; stops an MLV). Replace those
-     * too, so a half-press keeps the mode already in use. Named one by one on purpose. */
+     * freezes until release) and 0, 1, 1, 0 (5x3, raw height 697; stops an MLV). Change the same
+     * 4 words in those too, as for standby. Named one by one on purpose. */
     static int burst_kind = 0;      /* 0 other, 1 standby, 2 recording, 3 half-press */
     if (off == 4 && size == 52)
     {
@@ -945,9 +945,6 @@ static void FAST lvci_hook(uint32_t* regs, uint32_t* stack, uint32_t pc)
     /* only the 52-byte record differs between the states: substitute it in standby, with the
      * values captured while recording, or the ones measured in 1080p H.264 recording (lvci diff) */
     memcpy(lvci_tmp, src, size);
-    /* half-press: start from the standby record, not from the 120 Hz / 5x3 one */
-    if (burst_kind == 3 && e->stb_ok)
-        memcpy(lvci_tmp, lvci.pool + e->stb_pos, size);
     if (e->rec_ok && mode == 1)
         memcpy(lvci_tmp, lvci.pool + e->rec_pos, size);
     else if (mode == 1)
