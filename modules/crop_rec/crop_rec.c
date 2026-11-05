@@ -240,8 +240,6 @@ static volatile int gmt_trace = 0;          /* AF frame trace: only Gmt classes,
 static volatile int saf_trace_cls = -1;     /* when >= 0, Freeze trace keeps only this class, 154 and markers */
 static volatile int frz_trace = 0;          /* freeze trace: all classes, repeats collapsed, stops after a LV freeze */
 static volatile int frz_stop_at = 0;        /* 0 = running; else stop when dmlog_w reaches it */
-static volatile int msw_on = 0;             /* mode switch recorder owns the capture (see msw_watch_task) */
-static volatile int msw_shoot_hb = 0;       /* last time shoot_task ran our polling CBR */
 static uint32_t dm_cls_count[256];          /* messages per class (before collapsing), for the file header */
 static volatile int dmlog_paused = 0;
 static volatile int dmlog_stop_at = 0;      /* 0 = free running; else freeze when dmlog_w reaches it */
@@ -258,9 +256,6 @@ static void FAST dmlog_add(int cls, int lvl, const char * fmt, uint32_t a0, uint
         if (frz_trace && frz_stop_at && dmlog_w >= frz_stop_at) return;
         if (frz_trace && saf_trace_cls >= 0 && cls != DM_MARKER && cls != 154 && cls != 145 && cls != saf_trace_cls) return;   /* 145: [REG] sensor register writes */
         if (frz_trace && cls == 21) { dm_cls_count[21]++; return; }   /* register-write spam (~6000/s in mcm) */
-        /* recorder: the log only lasted ~0.5 s after a switch; drop register, AF, face and AE noise */
-        if (msw_on && (cls == 145 || cls == 173 || cls == 10 || cls == 0 || cls == 12 || cls == 178 || cls == 61 ||
-                       cls == 152 || cls == 177 || cls == 184 || cls == 170 || cls == 196 || cls == 175)) { dm_cls_count[cls & 0xFF]++; return; }
         if (cls != DM_MARKER) dm_cls_count[cls & 0xFF]++;
         int w = dmlog_w;
         if (w > 0)
@@ -3669,7 +3664,7 @@ static void saf_snap_poll(void)
 
 static void frz_trace_poll()
 {
-    if (!frz_trace || !is_EOSM2 || msw_on) return;
+    if (!frz_trace || !is_EOSM2) return;
 
     /* after a freeze, save the log by itself once capture has stopped (or 2 s later), so it
      * survives a battery pull when the camera can't be operated any more */
@@ -5106,236 +5101,10 @@ static void cr_ptp_poll(void)
     cr_ptp.cmd_done = cmd;
 }
 
-/* ---------------------------------------------------------------------------
- * Mode switch recorder (test builds, EOS M2): photo <-> movie can hang with a black screen, no
- * buttons and no USB, so nothing can be read at the moment it happens. Runs in its own task, not
- * in shoot_task, and does not depend on lv. After each shooting mode change it saves:
- *   ML/MSWnn.TXT   state at 10 Hz, then every task's state, wait object and saved stack
- *   ML/MSWnnL.TXT  Canon's DebugMsg log around the change
- * LED: fast blink = watching (the task is alive), solid = writing, off = saved.
- * --------------------------------------------------------------------------- */
-#define MSW_WINDOW_MS   8000
-#define MSW_SAMPLES     256
-#define MSW_MAX_SAVES   20
-#define MSW_TASKS_SIZE  (64*1024)      /* ~117 tasks, ~520 bytes each */
-#define MSW_STACK_WORDS 48
-#define M2_TASK_TABLE   (*(volatile uint32_t *)0x90F80)     /* is_taskid_valid, FFD74A20 */
-#define M2_TASK_SIZE    0x54
-
-struct msw_sample { int t; uint32_t disp, lvdma, hddma; int vsync, shoot_ago; uint8_t mode, lv, paused, gui, menu, raw;
-    int evf3; uint32_t evf_disp, evf_38, evf_08, g16, g28;
-    uint8_t half; uint32_t b08, b0c, b10, b18, raw_w, raw_h; };
-static volatile int msw_evf3_count = 0;
-static volatile uint32_t msw_evf_disp, msw_evf_38, msw_evf_08;
-static volatile uint32_t msw_evf_ctx = 0;
-static struct msw_sample msw_samples[MSW_SAMPLES];
-static volatile int msw_nsamples = 0;
-static char msw_tasks[MSW_TASKS_SIZE];
-static volatile int msw_tasks_len = 0;
-static volatile int msw_save_request = 0;
-static volatile int msw_saving = 0;
-
-static void msw_tasks_snapshot()
-{
-    extern unsigned int task_max;
-    extern int is_taskid_valid(int, int, void *);
-    int n = 0;
-    uint32_t table = M2_TASK_TABLE;
-    n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "# %d tasks; current %s; wait: 0 sleep 1 sem 2 flag 3 sendmq 4 recvmq 5 mutex; state: 0 ready 1 wait 2 susp\n",
-        task_max, current_task ? current_task->name : "?");
-    for (int id = 1; id <= (int) task_max && n < MSW_TASKS_SIZE - 900; id++)
-    {
-        struct task_attr_str a;
-        if (is_taskid_valid(1, id, &a) != 0) continue;
-        uint32_t tp = table + (id - 1) * M2_TASK_SIZE;
-        uint32_t wait_obj = MEM(tp + 0x14);
-        uint32_t ctx = MEM(tp + 0x50);       /* checked over USB: on its own stack for all tasks */
-        n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "%d %s pri %x wait %d state %d obj %x entry %x stack %x+%x", id,
-            a.name ? (char *) a.name : "?", a.pri, a.wait_id, a.state, wait_obj, a.entry, a.stack, a.size);
-        int ok = ctx >= a.stack && ctx + 0x40 <= a.stack + a.size;
-        if (ok)
-        {
-            struct context * c = (struct context *) ctx;
-            n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " sp %x pc %x lr %x\n ", ctx, c->pc, c->lr);
-            uint32_t sp = ctx + 0x40;
-            for (int i = 0; i < MSW_STACK_WORDS && sp + i * 4 < a.stack + a.size; i++)
-                n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " %x", MEM(sp + i * 4));
-        }
-        else
-        {
-            n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, " ctx %x (not on its stack)", ctx);
-        }
-        n += snprintf(msw_tasks + n, MSW_TASKS_SIZE - n, "\n");
-    }
-    msw_tasks_len = n;
-}
-
-/* Evf's frame interrupt, RAM 0x13180: only runs in its "3rd Frame" state (ctx+0x30 == 2). In the
- * hang this repeats every frame; it leaves that state once (flags+0x38 & 0xE) | Disp is nonzero
- * and flags+0xBEC is 0. Log what it actually sees (flags = ctx+0x4C, Disp = r7). */
-#define EVF_3RD_ADDR    0x13180
-#define EVF_3RD_INSN    0xE594004C      /* ldr r0, [r4, #0x4C] */
-#define MSW_EVF_GLOBAL  0x924CC  /* Disp comes from RAM 0x1842C: global+0x10, or global+0x1C and arg+4 == 0 */
-static void FAST msw_evf3_hook(uint32_t * regs, uint32_t * stack, uint32_t pc)
-{
-    uint32_t ctx = regs[4];
-    msw_evf_ctx = ctx;
-    uint32_t flags = MEM(ctx + 0x4C), other = MEM(ctx + 0x48);
-    uint32_t v38 = MEM(flags + 0x38), v08 = MEM(flags + 8);
-    /* only when something changes, so it can't fill the log */
-    if (!msw_evf3_count || regs[7] != msw_evf_disp || v38 != msw_evf_38 || v08 != msw_evf_08)
-    {
-        dmlog_add(DM_MARKER, 0, "*** MSW evf3 ctx %x flags %x +38 %x Disp %x bec %x", ctx, flags, v38, regs[7], MEM(flags + 0xBEC));
-        dmlog_add(DM_MARKER, 0, "*** MSW evf3 +08 %x +0c %x +10 %x other+38 %x r5+4 %x", v08, MEM(flags + 0xC), MEM(flags + 0x10), MEM(other + 0x38), MEM(regs[5] + 4));
-    }
-    msw_evf_disp = regs[7]; msw_evf_38 = v38; msw_evf_08 = v08;
-    msw_evf3_count++;
-}
-
-/* card writes block if the file task hangs: keep them away from msw_watch_task, so the LED still
- * shows whether ML is running, and write the small state file first */
-static void msw_save_task()
-{
-    TASK_LOOP
-    {
-        msleep(50);
-        if (!msw_save_request) continue;
-
-        char name[20], logname[20];
-        int num = 0;
-        for (num = 0; num < 99; num++)
-        {
-            uint32_t size;
-            snprintf(name, sizeof(name), "ML/MSW%02d.TXT", num);
-            if (FIO_GetFileSize(name, &size) != 0) break;
-        }
-        snprintf(name, sizeof(name), "ML/MSW%02d.TXT", num);
-        snprintf(logname, sizeof(logname), "ML/MSW%02dL.TXT", num);
-
-        FILE * f = FIO_CreateFile(name);
-        if (f)
-        {
-            static char buf[MSW_SAMPLES * 180 + 100];
-            int len = snprintf(buf, sizeof(buf), "# t mode lv paused gui menu raw disp lvdma hddma vsync shoot_ago evf3 evfDisp evf38 evf08 g16 g28 half b08 b0c b10 b18 rawW rawH\n");
-            int total = msw_nsamples;
-            for (int i = MAX(0, total - MSW_SAMPLES); i < total; i++)
-            {
-                struct msw_sample * e = &msw_samples[i % MSW_SAMPLES];
-                len += snprintf(buf + len, sizeof(buf) - len, "%d %d %d %d %d %d %d %x %x %x %d %d %d %x %x %x %x %x %d %x %x %x %x %d %d\n", e->t, e->mode, e->lv, e->paused,
-                    e->gui, e->menu, e->raw, e->disp, e->lvdma, e->hddma, e->vsync, e->shoot_ago, e->evf3, e->evf_disp, e->evf_38, e->evf_08, e->g16, e->g28,
-                    e->half, e->b08, e->b0c, e->b10, e->b18, e->raw_w, e->raw_h);
-            }
-            FIO_WriteFile(f, buf, len);
-            FIO_WriteFile(f, msw_tasks, msw_tasks_len);
-            FIO_CloseFile(f);
-        }
-        dmlog_save_as(logname);
-
-        frz_stop_at = 0;
-        msw_save_request = 0;
-        msw_saving = 0;
-    }
-}
-
-static void msw_watch_task()
-{
-    /* same capture as Freeze trace; started after boot, as from the menu */
-    msleep(5000);
-    if (!dmlog_hooked) dmlog_hooked = install_debugmsg_capture();
-    if (!dmlog_hooked) return;
-    msw_on = 1;
-    frz_trace = 2;
-    int hook_err = patch_hook_function(EVF_3RD_ADDR, EVF_3RD_INSN, &msw_evf3_hook, "crop_rec: Evf 3rd frame");
-    dmlog_add(DM_MARKER, 0, "*** MSW start, evf3 hook %d", hook_err, 0, 0, 0, 0);
-
-    int last_mode = shooting_mode, t_change = 0;
-    int saves = 0, reason = 0;
-
-    TASK_LOOP
-    {
-        msleep(100);
-        int now = get_ms_clock();
-        uint32_t disp = M2_LV_DISPLAY_ADDR;
-
-        struct msw_sample * e = &msw_samples[msw_nsamples % MSW_SAMPLES];
-        e->t = now; e->disp = disp;
-        e->lvdma = shamem_read(M2_EDMAC_LV_ADDR); e->hddma = shamem_read(M2_EDMAC_HD_ADDR);
-        e->vsync = aflog_frames; e->shoot_ago = now - msw_shoot_hb;
-        e->mode = shooting_mode; e->lv = lv; e->paused = lv_paused; e->gui = gui_state;
-        e->menu = gui_menu_shown(); e->raw = raw_lv_is_enabled();
-        e->evf3 = msw_evf3_count; e->evf_disp = msw_evf_disp; e->evf_38 = msw_evf_38; e->evf_08 = msw_evf_08;
-        { uint32_t g = MEM(MSW_EVF_GLOBAL); e->g16 = g ? MEM(g + 16) : 0xFFFF; e->g28 = g ? MEM(g + 28) : 0xFFFF; }
-        e->half = get_halfshutter_pressed();
-        e->raw_w = raw_info.jpeg.width; e->raw_h = raw_info.jpeg.height;
-        {
-            /* Canon's current per-frame settings: which LV record is really in use */
-            uint32_t flags = msw_evf_ctx ? MEM(msw_evf_ctx + 0x4C) : 0;
-            e->b08 = flags ? MEM(flags + 0x08) : 0xFF; e->b0c = flags ? MEM(flags + 0x0C) : 0xFF;
-            e->b10 = flags ? MEM(flags + 0x10) : 0xFF; e->b18 = flags ? MEM(flags + 0x18) : 0xFF;
-        }
-        msw_nsamples++;
-
-        /* a new switch while the previous one is still being watched just restarts the window */
-        if (shooting_mode != last_mode)
-        {
-            dmlog_add(DM_MARKER, 0, "*** MSW shooting mode %d -> %d, lv %d", last_mode, shooting_mode, lv, 0, 0);
-            last_mode = shooting_mode;
-            if (!t_change) frz_stop_at = dmlog_w + 3500;    /* keep what follows, even if AF floods the log */
-            t_change = now;
-            reason = 1;
-        }
-
-        /* half-press: same as a mode switch; the window starts when it's released */
-        {
-            static int last_half = 0;
-            int half = get_halfshutter_pressed();
-            if (half && !last_half)
-            {
-                dmlog_add(DM_MARKER, 0, "*** MSW half-press, lv %d, mode %d", lv, shooting_mode, 0, 0, 0);
-                if (!t_change) frz_stop_at = dmlog_w + 3500;
-                reason = 1;
-            }
-            else if (!half && last_half)
-            {
-                dmlog_add(DM_MARKER, 0, "*** MSW half-press released", 0, 0, 0, 0, 0);
-            }
-            if (half) t_change = now;
-            last_half = half;
-        }
-
-        if (t_change)
-        {
-            if (k & 1) info_led_on(); else info_led_off();
-
-            if (now - t_change > MSW_WINDOW_MS && !msw_saving)
-            {
-                t_change = 0;
-                if (RECORDING || saves >= MSW_MAX_SAVES) { frz_stop_at = 0; info_led_off(); continue; }
-                saves++;
-                msw_tasks_snapshot();
-                msw_saving = 1;
-                msw_save_request = reason;
-                info_led_on();
-            }
-        }
-        else if (msw_saving)
-        {
-            info_led_on();
-        }
-        else if (reason)
-        {
-            reason = 0;
-            info_led_off();
-        }
-    }
-}
-
 static unsigned int crop_rec_polling_cbr(unsigned int unused)
 {
     /* also check at startup */
     static int lv_dirty = 1;
-
-    msw_shoot_hb = get_ms_clock();
 
     /* Canon 3x3 preset: returning from photo mode needs the LiveView restart below too. The raw
      * stream may be on the slurp there, and this preset needs Canon's lv_save_raw in movie mode */
@@ -5656,12 +5425,6 @@ static unsigned int crop_rec_init()
     update_patch();
 
     if (is_EOSM2) cr_ptp_init();
-
-    if (is_EOSM2)
-    {
-        task_create("msw_watch", 0x10, 0x1000, msw_watch_task, 0);
-        task_create("msw_save", 0x1d, 0x1000, msw_save_task, 0);
-    }
 
     return 0;
 }
