@@ -93,7 +93,6 @@ static CONFIG_INT("raw.slurp", raw_slurp_menu, 1);
 static CONFIG_INT("raw.own_buffer", raw_own_buffer, 0);
 static int raw_slurp_active = 1;    /* latched in raw_lv_enable */
 static int lv_raw_enabled_ext();
-static void raw_slurp_stop_channel();
 /* crop_rec "1080p 3x3 (Canon AF)" (EOS M2): Canon's recording route starves the slurp (3% of
  * frames lose 7-14 lines mid-frame); Canon's own raw DMA (lv_save_raw) records it cleanly */
 static int raw_force_canon = 0;
@@ -2613,13 +2612,7 @@ static void raw_lv_enable()
     lv_raw_enabled = 1;
 
 #ifdef RAW_HAVE_SAVE_RAW
-    if (!RAW_SLURP)
-    {
-    #ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
-        raw_slurp_stop_channel();   /* in case the slurp ran earlier in this session */
-    #endif
-        call("lv_save_raw", 1);
-    }
+    if (!RAW_SLURP) call("lv_save_raw", 1);
 #endif
 
 #ifdef DEFAULT_RAW_BUFFER
@@ -2654,31 +2647,10 @@ static void raw_lv_enable()
 #endif
 }
 
-#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
-/* stop a slurp transfer still pending on the write channel (it stays armed on the sensor
- * stream after the last frame); left there, it took the data Canon's own raw DMA needed when
- * switching to lv_save_raw at runtime (EOS M2 1080p 3x3 preset): black screen, GUI hung */
-static void raw_slurp_stop_channel()
-{
-    extern uint32_t raw_write_chan __attribute__((weak));
-    extern uint32_t edmac_get_base(uint32_t channel) __attribute__((weak));
-    extern void AbortEDmac(unsigned int channel) __attribute__((weak));
-    if (!&raw_write_chan || !edmac_get_base || !AbortEDmac) return;
-    if (MEM(edmac_get_base(raw_write_chan)) & 1)
-    {
-        AbortEDmac(raw_write_chan);
-        printf("LV raw: stopped pending slurp transfer\n");
-    }
-}
-#endif
-
 static void raw_lv_disable()
 {
     ASSERT(!lv_raw_gain);
     lv_raw_enabled = 0;
-#ifdef CONFIG_EDMAC_RAW_SLURP_OPTIONAL
-    if (RAW_SLURP) raw_slurp_stop_channel();
-#endif
 #ifdef CONFIG_EOSM2
     isr_cur_dst = 0;        /* re-prime from the vsync when enabled again */
 #endif
